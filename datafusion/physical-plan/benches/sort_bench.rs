@@ -60,7 +60,6 @@ use datafusion_physical_expr::expressions::Column;
 use datafusion_physical_expr_common::sort_expr::{LexOrdering, PhysicalSortExpr};
 use datafusion_physical_plan::sorts::sort::SortExec;
 use datafusion_physical_plan::{ExecutionPlan, collect};
-use tokio::runtime::Runtime;
 
 use bench_utils::{
     BatchSourceExec, FunctionalBatchGenerator, create_schema, deserialize_from_ipc,
@@ -139,8 +138,12 @@ fn create_sort_plan(
 /// 6. **full_pipeline_limit_10k**: Complete deser + TopK sort + output serialization
 ///    - Real-world latency for LIMIT queries including result serialization
 fn bench_sort(c: &mut Criterion) {
-    // Create a Tokio runtime for async execution
-    let rt = Runtime::new().unwrap();
+    // Create a single-threaded Tokio runtime for async execution.
+    // We use current_thread to ensure all async work runs on the benchmark thread,
+    // making results comparable to single-threaded Java benchmarks.
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap();
     let mut group = c.benchmark_group("sort_bench");
 
     // Use flat sampling to collect exactly the requested samples without time constraints

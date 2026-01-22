@@ -19,7 +19,7 @@
 //!
 //! This benchmark measures the end-to-end latency of:
 //! 1. Deserializing Arrow IPC data into RecordBatches
-//! 2. Executing a FilterExec operator (predicate: colInt > 2500)
+//! 2. Executing a FilterExec operator (predicate: colInt > 0)
 //! 3. Serializing the output back to Arrow IPC format
 //!
 //! The benchmark helps understand the overhead of IPC deserialization
@@ -57,7 +57,6 @@ use datafusion_physical_expr::expressions::{BinaryExpr, Column, Literal};
 use datafusion_physical_expr::PhysicalExpr;
 use datafusion_physical_plan::filter::FilterExecBuilder;
 use datafusion_physical_plan::{ExecutionPlan, collect};
-use tokio::runtime::Runtime;
 
 use bench_utils::{
     BatchSourceExec, FunctionalBatchGenerator, create_schema, deserialize_from_ipc,
@@ -68,10 +67,10 @@ use bench_utils::{
 // Filter Plan Creation
 // ============================================================================
 
-/// Creates a FilterExec that evaluates `colInt > 2500`.
+/// Creates a FilterExec that evaluates `colInt > 0`.
 ///
 /// With the data generation pattern `colInt = i % 5000`, this predicate
-/// has approximately 50% selectivity (values 2501-4999 pass, 0-2500 don't).
+/// has low selectivity.
 ///
 /// # Arguments
 /// * `input` - The input execution plan (typically BatchSourceExec)
@@ -83,11 +82,11 @@ fn create_filter_plan(
     input: Arc<dyn ExecutionPlan>,
     schema: &SchemaRef,
 ) -> Arc<dyn ExecutionPlan> {
-    // Build the predicate: colInt > 2500
+    // Build the predicate: colInt > 0
     let col_int = Arc::new(Column::new_with_schema("colInt", schema).unwrap())
         as Arc<dyn PhysicalExpr>;
     let threshold =
-        Arc::new(Literal::new(ScalarValue::Int32(Some(2500)))) as Arc<dyn PhysicalExpr>;
+        Arc::new(Literal::new(ScalarValue::Int32(Some(0)))) as Arc<dyn PhysicalExpr>;
     let predicate =
         Arc::new(BinaryExpr::new(col_int, Operator::Gt, threshold)) as Arc<dyn PhysicalExpr>;
 
@@ -119,8 +118,12 @@ fn create_filter_plan(
 ///    - Real-world end-to-end latency including result serialization
 ///    - Relevant for scenarios where results are sent over network
 fn bench_filter(c: &mut Criterion) {
-    // Create a Tokio runtime for async execution
-    let rt = Runtime::new().unwrap();
+    // Create a single-threaded Tokio runtime for async execution.
+    // We use current_thread to ensure all async work runs on the benchmark thread,
+    // making results comparable to single-threaded Java benchmarks.
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap();
     let mut group = c.benchmark_group("filter_bench");
 
     // Use flat sampling to collect exactly the requested samples without time constraints
