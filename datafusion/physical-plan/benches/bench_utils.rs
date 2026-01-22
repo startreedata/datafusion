@@ -20,16 +20,18 @@
 //! This module provides common functionality for benchmarks that measure
 //! Arrow IPC deserialization combined with DataFusion execution plans.
 
-use std::io::Cursor;
 use std::sync::Arc;
 
 use arrow::array::{
     ArrayRef, BinaryArray, Float32Array, Float64Array, Int32Array, Int64Array,
     RecordBatch, StringArray,
 };
+use arrow::buffer::Buffer;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
-use arrow::ipc::reader::StreamReader;
-use arrow::ipc::writer::StreamWriter;
+use arrow::ipc::convert::fb_to_schema;
+use arrow::ipc::reader::{FileDecoder, read_footer_length};
+use arrow::ipc::writer::FileWriter;
+use arrow::ipc::root_as_footer;
 use datafusion_execution::TaskContext;
 use datafusion_physical_expr::EquivalenceProperties;
 use datafusion_physical_plan::execution_plan::{Boundedness, EmissionType};
@@ -218,10 +220,10 @@ impl FunctionalBatchGenerator {
 // Arrow IPC Serialization / Deserialization
 // ============================================================================
 
-/// Serializes record batches to Arrow IPC stream format (in-memory).
+/// Serializes record batches to Arrow IPC file format (in-memory).
 ///
 /// This simulates receiving Arrow data over a network or reading from storage.
-/// The IPC format is Arrow's standard binary interchange format.
+/// Uses the IPC file format (with footer) to enable zero-copy deserialization.
 ///
 /// # Arguments
 /// * `batches` - Record batches to serialize
@@ -232,7 +234,7 @@ impl FunctionalBatchGenerator {
 pub fn serialize_to_ipc(batches: &[RecordBatch], schema: &SchemaRef) -> Vec<u8> {
     let mut buffer = Vec::new();
     {
-        let mut writer = StreamWriter::try_new(&mut buffer, schema).unwrap();
+        let mut writer = FileWriter::try_new(&mut buffer, schema).unwrap();
         for batch in batches {
             writer.write(batch).unwrap();
         }
@@ -241,10 +243,13 @@ pub fn serialize_to_ipc(batches: &[RecordBatch], schema: &SchemaRef) -> Vec<u8> 
     buffer
 }
 
-/// Deserializes record batches from Arrow IPC stream format.
+/// Deserializes record batches from Arrow IPC file format using zero-copy.
 ///
 /// This is the operation being benchmarked - converting serialized Arrow IPC
 /// data back into in-memory record batches that can be processed by DataFusion.
+///
+/// Zero-copy means the Arrow arrays refer directly to the provided buffer,
+/// avoiding memory copying during deserialization.
 ///
 /// # Arguments
 /// * `data` - Serialized IPC data
@@ -252,10 +257,36 @@ pub fn serialize_to_ipc(batches: &[RecordBatch], schema: &SchemaRef) -> Vec<u8> 
 /// # Returns
 /// Tuple of (schema, batches) extracted from the IPC data
 pub fn deserialize_from_ipc(data: &[u8]) -> (SchemaRef, Vec<RecordBatch>) {
-    let cursor = Cursor::new(data);
-    let reader = StreamReader::try_new(cursor, None).unwrap();
-    let schema = reader.schema();
-    let batches: Vec<RecordBatch> = reader.map(|r| r.expect("Failed to read batch")).collect();
+    // Convert the byte slice to a Buffer for zero-copy deserialization
+    let buffer = Buffer::from_vec(data.to_vec());
+
+    // Read the footer to get schema and batch locations
+    let trailer_start = buffer.len() - 10;
+    let footer_len = read_footer_length(buffer[trailer_start..].try_into().unwrap()).unwrap();
+    let footer = root_as_footer(&buffer[trailer_start - footer_len..trailer_start]).unwrap();
+
+    let schema = Arc::new(fb_to_schema(footer.schema().unwrap()));
+    let mut decoder = FileDecoder::new(Arc::clone(&schema), footer.version());
+
+    // Read dictionaries if present
+    for block in footer.dictionaries().iter().flatten() {
+        let block_len = block.bodyLength() as usize + block.metaDataLength() as usize;
+        let data = buffer.slice_with_length(block.offset() as _, block_len);
+        decoder.read_dictionary(block, &data).unwrap();
+    }
+
+    // Read all record batches
+    let mut batches = Vec::new();
+    if let Some(batch_blocks) = footer.recordBatches() {
+        for block in batch_blocks {
+            let block_len = block.bodyLength() as usize + block.metaDataLength() as usize;
+            let data = buffer.slice_with_length(block.offset() as _, block_len);
+            if let Some(batch) = decoder.read_record_batch(&block, &data).unwrap() {
+                batches.push(batch);
+            }
+        }
+    }
+
     (schema, batches)
 }
 

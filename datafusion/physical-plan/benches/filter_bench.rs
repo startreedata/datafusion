@@ -35,11 +35,48 @@
 //! # Run with fewer samples for quick testing
 //! cargo bench --bench filter_bench -p datafusion-physical-plan -- --sample-size 10
 //!
+//! # Run only the deser_only benchmark
+//! cargo bench --bench filter_bench -p datafusion-physical-plan -- deser_only
+//!
+//! # Change measurement time (per benchmark, default is 5 seconds)
+//! cargo bench --bench filter_bench -p datafusion-physical-plan -- --measurement-time 10
+//!
 //! # Run specific configuration
 //! cargo bench --bench filter_bench -p datafusion-physical-plan -- "1M_rows_binary_10B"
 //! ```
+//!
+//! ## Baseline Management
+//!
+//! Criterion stores benchmark results in `target/criterion/` and automatically compares
+//! new runs against previous results. Each benchmark has three states:
+//! - **base/**: The baseline for comparison (saved with --save-baseline)
+//! - **new/**: The most recent benchmark run
+//! - **change/**: Statistics about the change from base to new
+//!
+//! ```bash
+//! # Save current results as a named baseline (e.g., "main" or "before-optimization")
+//! cargo bench --bench filter_bench -p datafusion-physical-plan -- --save-baseline my-baseline
+//!
+//! # Compare against a specific baseline
+//! cargo bench --bench filter_bench -p datafusion-physical-plan -- --baseline my-baseline
+//!
+//! # List all saved baselines (stored in target/criterion/<benchmark-name>/<test-name>/)
+//! ls target/criterion/filter_bench/deser_only/1M_rows_binary_10B/
+//!
+//! # Delete all benchmark history and start fresh
+//! rm -rf target/criterion
+//!
+//! # Run without saving results (useful for quick checks)
+//! cargo bench --bench filter_bench -p datafusion-physical-plan -- --profile-time 1
+//! ```
+//!
+//! **Typical workflow for tracking performance:**
+//! 1. Before making changes: `cargo bench --bench filter_bench -- --save-baseline before`
+//! 2. Make your code changes
+//! 3. Compare: `cargo bench --bench filter_bench -- --baseline before`
+//! 4. Criterion will show % change from the "before" baseline
 
-// Include shared benchmark utilities
+// Include shared benchmark utilitiesi
 #[path = "bench_utils.rs"]
 mod bench_utils;
 
@@ -128,6 +165,10 @@ fn bench_filter(c: &mut Criterion) {
 
     // Use flat sampling to collect exactly the requested samples without time constraints
     group.sampling_mode(SamplingMode::Flat);
+
+    // Set measurement time (default is 5 seconds)
+    // Uncomment and adjust the duration as needed:
+    // group.measurement_time(std::time::Duration::from_secs(10));
 
     // Configuration: 1M rows total (10K rows × 100 batches)
     let rows_per_batch = 10_000;
