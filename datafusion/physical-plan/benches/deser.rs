@@ -17,17 +17,6 @@
 
 //! Benchmark for Arrow IPC deserialization performance.
 //!
-//! This benchmark measures the overhead of deserializing Arrow IPC data into RecordBatches,
-//! comparing two approaches:
-//!
-//! 1. **deserialize_from_ipc**: Standard deserialization that copies data
-//! 2. **deserialize_zero_copy**: Zero-copy deserialization using Buffer slicing
-//!
-//! The benchmark helps understand:
-//! - Standard deserialization cost vs. zero-copy deserialization
-//! - How deserialization performance scales with data size and binary column sizes
-//! - Cost of IPC format decoding (metadata parsing + data access)
-//!
 //! ## Running the benchmark
 //!
 //! ```bash

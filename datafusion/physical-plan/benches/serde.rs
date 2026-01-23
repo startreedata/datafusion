@@ -17,17 +17,6 @@
 
 //! Benchmark for Arrow IPC serialization performance.
 //!
-//! This benchmark measures the overhead of serializing RecordBatches to Arrow IPC format,
-//! comparing two approaches:
-//!
-//! 1. **serialize_to_sink**: Writes to a sink that discards data (measures pure CPU cost)
-//! 2. **serialize_to_ipc**: Writes to a Vec<u8> (includes memory allocation overhead)
-//!
-//! The benchmark helps understand:
-//! - Pure serialization CPU cost vs. memory allocation overhead
-//! - How serialization performance scales with data size and binary column sizes
-//! - Cost of IPC format encoding (metadata + data alignment)
-//!
 //! ## Running the benchmark
 //!
 //! ```bash

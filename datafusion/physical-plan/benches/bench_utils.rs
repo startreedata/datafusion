@@ -244,25 +244,6 @@ pub fn serialize_to_ipc(batches: &[RecordBatch], schema: &SchemaRef) -> Vec<u8> 
     buffer
 }
 
-/// Deserializes record batches from Arrow IPC file format paying the cost of a copy.
-///
-/// This is the operation being benchmarked - converting serialized Arrow IPC
-/// data back into in-memory record batches that can be processed by DataFusion.
-///
-/// This functions copies the received byte slice into a Buffer, so it is not zero-copy.
-///
-/// # Arguments
-/// * `data` - Serialized IPC data
-///
-/// # Returns
-/// Tuple of (schema, batches) extracted from the IPC data
-pub fn deserialize_from_ipc(data: &[u8]) -> (SchemaRef, Vec<RecordBatch>) {
-    // Convert the byte slice to a Buffer for zero-copy deserialization
-    let buffer = Buffer::from_vec(data.to_vec());
-    deserialize_zero_copy(&buffer)
-}
-
-
 /// Deserializes record batches from Arrow IPC file format using zero-copy.
 ///
 /// This is the operation being benchmarked - converting serialized Arrow IPC
