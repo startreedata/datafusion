@@ -163,33 +163,6 @@ fn bench_filter(c: &mut Criterion) {
         // Set throughput metric for bytes/second calculations
         group.throughput(Throughput::Bytes(ipc_size as u64));
 
-        // Benchmark 1: IPC Deserialization only
-        // Measures the cost of parsing Arrow IPC format into RecordBatches
-        group.bench_with_input(
-            BenchmarkId::new("deser_only", &label),
-            &ipc_data,
-            |b, ipc_data| {
-                b.iter(|| {
-                    let (schema, batches) = deserialize_from_ipc(ipc_data);
-                    // black_box prevents compiler from optimizing away unused results
-                    black_box((schema, batches))
-                })
-            },
-        );
-
-        // Benchmark 2: IPC Serialization only
-        // Measures the cost of serializing RecordBatches to IPC format
-        group.bench_with_input(
-            BenchmarkId::new("ser_only", &label),
-            &batches,
-            |b, batches| {
-                b.iter(|| {
-                    let output_ipc = serialize_to_ipc(batches, &schema);
-                    black_box(output_ipc)
-                })
-            },
-        );
-
         // Benchmark 3: Filter execution only
         // Uses pre-generated batches directly, isolating FilterExec performance
         group.bench_with_input(

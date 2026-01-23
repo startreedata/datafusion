@@ -110,3 +110,12 @@ name = "filter_bench"
 [[bench]]
 harness = false
 name = "sort_bench"
+
+[[bench]]
+harness = false
+name = "deser"
+
+[[bench]]
+harness = false
+name = "serde"
+
