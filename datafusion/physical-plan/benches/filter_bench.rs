@@ -76,7 +76,7 @@
 //! 3. Compare: `cargo bench --bench filter_bench -- --baseline before`
 //! 4. Criterion will show % change from the "before" baseline
 
-// Include shared benchmark utilitiesi
+// Include shared benchmark utilities
 #[path = "bench_utils.rs"]
 mod bench_utils;
 

@@ -73,74 +73,12 @@ use criterion::{
 };
 
 use bench_utils::{
-    FunctionalBatchGenerator, create_schema, deserialize_from_ipc,
-    deserialize_zero_copy, serialize_to_ipc,
+    FunctionalBatchGenerator, create_schema, deserialize_zero_copy, serialize_to_ipc,
 };
 
 // ============================================================================
 // Benchmark Implementation
 // ============================================================================
-
-/// Benchmarks standard IPC deserialization (with data copying).
-///
-/// This measures the cost of Arrow IPC deserialization using the standard
-/// approach where data may be copied during the deserialization process.
-/// This is the typical deserialization path when reading from files or
-/// network streams.
-fn bench_deserialize_standard(c: &mut Criterion) {
-    let mut group = c.benchmark_group("deserialize_standard");
-
-    // Use flat sampling to collect exactly the requested samples without time constraints
-    group.sampling_mode(SamplingMode::Flat);
-
-    // Configuration: 1M rows total (10K rows × 100 batches)
-    let rows_per_batch = 10_000;
-    let num_batches = 100;
-    let total_rows = rows_per_batch * num_batches;
-
-    // Test different binary column sizes to understand deserialization overhead
-    let binary_sizes = vec![10, 1024, 2048];
-
-    for binary_size in binary_sizes {
-        let label = format!("1M_rows_binary_{binary_size}B");
-
-        // Generate test data and serialize to IPC format
-        let schema = create_schema();
-        let mut generator = FunctionalBatchGenerator::new(
-            Arc::clone(&schema),
-            rows_per_batch,
-            num_batches,
-            binary_size,
-        );
-        let batches = generator.generate_batches();
-        let ipc_data = serialize_to_ipc(&batches, &schema);
-
-        // Set throughput metric for bytes/second calculations
-        group.throughput(Throughput::Bytes(ipc_data.len() as u64));
-
-        // Log configuration
-        println!(
-            "Config (standard): {} rows, binary_size={} bytes, IPC size={:.2} MB",
-            total_rows,
-            binary_size,
-            ipc_data.len() as f64 / (1024.0 * 1024.0)
-        );
-
-        group.bench_with_input(
-            BenchmarkId::from_parameter(&label),
-            &ipc_data,
-            |b, ipc_data| {
-                b.iter(|| {
-                    let (schema, batches) = deserialize_from_ipc(ipc_data);
-                    // black_box prevents compiler from optimizing away unused results
-                    black_box((schema, batches))
-                })
-            },
-        );
-    }
-
-    group.finish();
-}
 
 /// Benchmarks zero-copy IPC deserialization.
 ///
@@ -151,8 +89,8 @@ fn bench_deserialize_standard(c: &mut Criterion) {
 ///
 /// This is the most efficient deserialization approach when you have
 /// a contiguous buffer (e.g., mmap'd file or received network buffer).
-fn bench_deserialize_zero_copy(c: &mut Criterion) {
-    let mut group = c.benchmark_group("deserialize_zero_copy");
+fn bench_deserialize(c: &mut Criterion) {
+    let mut group = c.benchmark_group("deserialize_standard");
 
     // Use flat sampling to collect exactly the requested samples without time constraints
     group.sampling_mode(SamplingMode::Flat);
@@ -209,5 +147,5 @@ fn bench_deserialize_zero_copy(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_deserialize_standard, bench_deserialize_zero_copy);
+criterion_group!(benches, bench_deserialize);
 criterion_main!(benches);
