@@ -82,7 +82,7 @@ mod bench_utils;
 
 use std::hint::black_box;
 use std::sync::Arc;
-
+use arrow::buffer::Buffer;
 use arrow::datatypes::SchemaRef;
 use criterion::{
     BatchSize, BenchmarkId, Criterion, SamplingMode, Throughput, criterion_group, criterion_main,
@@ -96,8 +96,8 @@ use datafusion_physical_plan::filter::FilterExecBuilder;
 use datafusion_physical_plan::{ExecutionPlan, collect};
 
 use bench_utils::{
-    BatchSourceExec, FunctionalBatchGenerator, create_schema, deserialize_from_ipc,
-    serialize_results_to_ipc, serialize_to_ipc,
+    BatchSourceExec, FunctionalBatchGenerator, create_schema, deserialize_zero_copy,
+    serialize_batches_to_sink, serialize_to_ipc,
 };
 
 // ============================================================================
@@ -192,6 +192,7 @@ fn bench_filter(c: &mut Criterion) {
         let batches = generator.generate_batches();
         let ipc_data = serialize_to_ipc(&batches, &schema);
         let ipc_size = ipc_data.len();
+        let ipc_buffer = Buffer::from_vec(ipc_data);
 
         // Log configuration for visibility in benchmark output
         println!(
@@ -236,11 +237,11 @@ fn bench_filter(c: &mut Criterion) {
         // Relevant for scenarios where results are sent over network or stored
         group.bench_with_input(
             BenchmarkId::new("full_pipeline", &label),
-            &ipc_data,
-            |b, ipc_data| {
+            &ipc_buffer,
+            |b, ipc_buffer| {
                 b.iter(|| {
                     rt.block_on(async {
-                        let (schema, batches) = deserialize_from_ipc(ipc_data);
+                        let (schema, batches) = deserialize_zero_copy(ipc_buffer);
                         let source = Arc::new(BatchSourceExec::new(
                             Arc::clone(&schema),
                             batches,
@@ -249,8 +250,7 @@ fn bench_filter(c: &mut Criterion) {
                         let task_ctx = Arc::new(TaskContext::default());
                         let results = collect(plan, task_ctx).await.unwrap();
                         // Serialize results back to IPC format
-                        let output_ipc = serialize_results_to_ipc(&results);
-                        black_box(output_ipc)
+                        black_box(serialize_batches_to_sink(&results, &schema))
                     })
                 })
             },

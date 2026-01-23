@@ -75,21 +75,83 @@ use criterion::{
 };
 
 use bench_utils::{
-    FunctionalBatchGenerator, create_schema, serialize_results_to_ipc,
+    FunctionalBatchGenerator, create_schema, serialize_batches_to_sink,
+    serialize_results_to_ipc,
 };
 
 // ============================================================================
 // Benchmark Implementation
 // ============================================================================
 
+/// Benchmarks serialization to a sink that drops all data.
+///
+/// This measures the pure CPU cost of Arrow IPC serialization without
+/// including memory allocation or I/O overhead. Useful for understanding
+/// the baseline serialization cost.
+fn bench_serialize_to_sink(c: &mut Criterion) {
+    let mut group = c.benchmark_group("serialize_to_sink");
+
+    // Use flat sampling to collect exactly the requested samples without time constraints
+    group.sampling_mode(SamplingMode::Flat);
+
+    // Configuration: 1M rows total (10K rows × 100 batches)
+    let rows_per_batch = 10_000;
+    let num_batches = 100;
+    let total_rows = rows_per_batch * num_batches;
+
+    // Test different binary column sizes to understand serialization overhead
+    let binary_sizes = vec![10, 1024, 2048];
+
+    for binary_size in binary_sizes {
+        let label = format!("1M_rows_binary_{binary_size}B");
+
+        // Generate test data
+        let schema = create_schema();
+        let mut generator = FunctionalBatchGenerator::new(
+            Arc::clone(&schema),
+            rows_per_batch,
+            num_batches,
+            binary_size,
+        );
+        let batches = generator.generate_batches();
+
+        // Calculate expected output size for throughput metric
+        let expected_size = estimate_serialized_size(&batches, binary_size, total_rows);
+
+        // Set throughput metric for bytes/second calculations
+        group.throughput(Throughput::Bytes(expected_size as u64));
+
+        // Log configuration
+        println!(
+            "Config (sink): {} rows, binary_size={} bytes, estimated output={:.2} MB",
+            total_rows,
+            binary_size,
+            expected_size as f64 / (1024.0 * 1024.0)
+        );
+
+        group.bench_with_input(
+            BenchmarkId::from_parameter(&label),
+            &batches,
+            |b, batches| {
+                b.iter(|| {
+                    let bytes_written = serialize_batches_to_sink(batches, &schema);
+                    // black_box prevents compiler from optimizing away unused results
+                    black_box(bytes_written)
+                })
+            },
+        );
+    }
+
+    group.finish();
+}
 
 /// Benchmarks serialization to memory (Vec<u8>).
 ///
 /// This measures the full cost of Arrow IPC serialization including
 /// memory allocation overhead. This is what happens in real-world
 /// scenarios when sending data over a network or writing to storage.
-fn bench_serialize(c: &mut Criterion) {
-    let mut group = c.benchmark_group("serialize");
+fn bench_serialize_to_memory(c: &mut Criterion) {
+    let mut group = c.benchmark_group("serialize_to_memory");
 
     // Use flat sampling to collect exactly the requested samples without time constraints
     group.sampling_mode(SamplingMode::Flat);
@@ -171,6 +233,6 @@ fn estimate_serialized_size(batches: &[arrow::array::RecordBatch], binary_size: 
     overhead + (total_rows * per_row_size)
 }
 
-criterion_group!(benches, bench_serialize);
+criterion_group!(benches, bench_serialize_to_sink, bench_serialize_to_memory);
 criterion_main!(benches);
 
