@@ -63,6 +63,30 @@ pub fn create_schema() -> SchemaRef {
     ]))
 }
 
+/// Creates a single-column schema with an Int32 column.
+///
+/// Used for aggregation benchmarks where we want to isolate
+/// the grouping column performance without other columns.
+pub fn create_int_column_schema() -> SchemaRef {
+    Arc::new(Schema::new(vec![Field::new(
+        "groupCol",
+        DataType::Int32,
+        false,
+    )]))
+}
+
+/// Creates a single-column schema with a Binary column.
+///
+/// Used for aggregation benchmarks to test grouping performance
+/// with variable-length binary keys.
+pub fn create_binary_column_schema() -> SchemaRef {
+    Arc::new(Schema::new(vec![Field::new(
+        "groupCol",
+        DataType::Binary,
+        false,
+    )]))
+}
+
 // ============================================================================
 // Data Generation
 // ============================================================================
@@ -211,6 +235,145 @@ impl FunctionalBatchGenerator {
         (0..self.num_batches)
             .map(|i| self.generate_batch(i))
             .collect()
+    }
+}
+
+// ============================================================================
+// Single Column Data Generation (for aggregation benchmarks)
+// ============================================================================
+
+/// Type of single-column data to generate.
+#[derive(Debug, Clone, Copy)]
+pub enum SingleColumnType {
+    /// Int32 column with uniform distribution over [0, distinct_count)
+    Int,
+    /// Binary column with configurable size and distinct count
+    Binary {
+        /// Size of each binary value in bytes
+        binary_size: usize,
+    },
+}
+
+/// Generates single-column record batches for aggregation benchmarks.
+///
+/// This generator creates data with a configurable number of distinct values,
+/// useful for testing GROUP BY or JOIN performance at different cardinalities.
+///
+/// Data patterns:
+/// - **Int column**: Random values with uniform distribution over [0, distinct_count).
+///   Uses a seeded RNG for reproducibility.
+/// - **Binary column**: Pre-generates `distinct_count` distinct random byte
+///   arrays of `binary_size` each, then selects randomly from them.
+///   This ensures exactly `distinct_count` unique binary values with uniform distribution.
+pub struct SingleColumnBatchGenerator {
+    /// Schema for generated batches (single column)
+    schema: SchemaRef,
+    /// Number of rows in each batch
+    rows_per_batch: usize,
+    /// Total number of batches to generate
+    num_batches: usize,
+    /// Number of distinct values to generate
+    distinct_count: usize,
+    /// Type of column to generate
+    column_type: SingleColumnType,
+    /// Pre-generated distinct binary values (only used for Binary column type)
+    distinct_binary_values: Vec<Vec<u8>>,
+    /// Random number generator for value selection (seeded for reproducibility)
+    rng: StdRng,
+}
+
+impl SingleColumnBatchGenerator {
+    /// Creates a new single-column batch generator.
+    ///
+    /// # Arguments
+    /// * `column_type` - Type of column to generate (Int or Binary)
+    /// * `rows_per_batch` - Number of rows per batch
+    /// * `num_batches` - Total number of batches to generate
+    /// * `distinct_count` - Number of distinct values in the column
+    ///
+    /// # Returns
+    /// A new generator configured for the specified column type and cardinality.
+    pub fn new(
+        column_type: SingleColumnType,
+        rows_per_batch: usize,
+        num_batches: usize,
+        distinct_count: usize,
+    ) -> Self {
+        // Create appropriate schema based on column type
+        let schema = match column_type {
+            SingleColumnType::Int => create_int_column_schema(),
+            SingleColumnType::Binary { .. } => create_binary_column_schema(),
+        };
+
+        // Use a fixed seed for reproducible benchmarks
+        let mut rng = StdRng::seed_from_u64(42);
+
+        // Pre-generate distinct binary values if needed
+        let distinct_binary_values = match column_type {
+            SingleColumnType::Binary { binary_size } => {
+                (0..distinct_count)
+                    .map(|_| {
+                        let mut buf = vec![0u8; binary_size];
+                        rng.fill(&mut buf[..]);
+                        buf
+                    })
+                    .collect()
+            }
+            SingleColumnType::Int => Vec::new(),
+        };
+
+        Self {
+            schema,
+            rows_per_batch,
+            num_batches,
+            distinct_count,
+            column_type,
+            distinct_binary_values,
+            rng,
+        }
+    }
+
+    /// Returns the schema of the generated batches.
+    pub fn schema(&self) -> SchemaRef {
+        Arc::clone(&self.schema)
+    }
+
+    /// Generates a single record batch.
+    ///
+    /// Values are randomly selected from [0, distinct_count) with uniform distribution.
+    fn generate_batch(&mut self) -> RecordBatch {
+        let num_rows = self.rows_per_batch;
+
+        let column: ArrayRef = match self.column_type {
+            SingleColumnType::Int => {
+                // Generate random int values with uniform distribution over [0, distinct_count)
+                let values: Vec<i32> = (0..num_rows)
+                    .map(|_| self.rng.random_range(0..self.distinct_count) as i32)
+                    .collect();
+                Arc::new(Int32Array::from(values))
+            }
+            SingleColumnType::Binary { .. } => {
+                // Randomly select from pre-generated distinct binary values
+                let values: Vec<&[u8]> = (0..num_rows)
+                    .map(|_| {
+                        let idx = self.rng.random_range(0..self.distinct_count);
+                        self.distinct_binary_values[idx].as_slice()
+                    })
+                    .collect();
+                Arc::new(BinaryArray::from(values))
+            }
+        };
+
+        RecordBatch::try_new(Arc::clone(&self.schema), vec![column])
+            .expect("Failed to create record batch")
+    }
+
+    /// Generates all batches.
+    ///
+    /// Returns a vector of `num_batches` record batches, each containing
+    /// `rows_per_batch` rows with values randomly selected from `distinct_count` unique values.
+    pub fn generate_batches(&mut self) -> Vec<RecordBatch> {
+        (0..self.num_batches).map(|_| self.generate_batch()).collect()
     }
 }
 

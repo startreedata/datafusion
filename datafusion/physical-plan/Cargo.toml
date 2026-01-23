@@ -119,3 +119,7 @@ name = "deser"
 harness = false
 name = "serde"
 
+[[bench]]
+harness = false
+name = "count_group_by_bench"
+
