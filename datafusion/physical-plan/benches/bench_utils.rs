@@ -23,8 +23,8 @@
 use std::sync::Arc;
 
 use arrow::array::{
-    ArrayRef, BinaryArray, Float32Array, Float64Array, Int32Array, Int64Array,
-    RecordBatch, StringArray,
+    ArrayRef, BinaryViewArray, Float32Array, Float64Array, Int32Array, Int64Array, RecordBatch,
+    StringViewArray
 };
 use arrow::buffer::Buffer;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
@@ -60,8 +60,8 @@ pub fn create_schema() -> SchemaRef {
         Field::new("colLong", DataType::Int64, false),
         Field::new("colFloat", DataType::Float32, false),
         Field::new("colDouble", DataType::Float64, false),
-        Field::new("colString", DataType::Utf8, false),
-        Field::new("colBinary", DataType::Binary, false),
+        Field::new("colString", DataType::Utf8View, false),
+        Field::new("colBinary", DataType::BinaryView, false),
     ]))
 }
 
@@ -187,7 +187,7 @@ impl FunctionalBatchGenerator {
                 let values: Vec<String> = (0..num_rows)
                     .map(|i| format!("str_{}", (start_row + i) % 100))
                     .collect();
-                Arc::new(StringArray::from(values))
+                Arc::new(StringViewArray::from(values))
             }
             "colBinary" => {
                 // Random binary data of configurable size
@@ -199,7 +199,7 @@ impl FunctionalBatchGenerator {
                     })
                     .collect();
                 let values: Vec<&[u8]> = values.iter().map(|v| v.as_slice()).collect();
-                Arc::new(BinaryArray::from(values))
+                Arc::new(BinaryViewArray::from(values))
             }
             _ => panic!("Unknown column: {}", field_name),
         }

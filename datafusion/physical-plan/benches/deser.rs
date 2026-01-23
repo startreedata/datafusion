@@ -15,118 +15,132 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Benchmark for Arrow IPC deserialization performance.
+//! Benchmark for DataFusion FilterExec with Arrow IPC serialization.
 //!
-//! This benchmark measures the overhead of deserializing Arrow IPC data into RecordBatches,
-//! comparing two approaches:
+//! This benchmark measures the end-to-end latency of:
+//! 1. Deserializing Arrow IPC data into RecordBatches
+//! 2. Executing a FilterExec operator (predicate: colInt > 2500)
+//! 3. Serializing the output back to Arrow IPC format
 //!
-//! 1. **deserialize_from_ipc**: Standard deserialization that copies data
-//! 2. **deserialize_zero_copy**: Zero-copy deserialization using Buffer slicing
-//!
-//! The benchmark helps understand:
-//! - Standard deserialization cost vs. zero-copy deserialization
-//! - How deserialization performance scales with data size and binary column sizes
-//! - Cost of IPC format decoding (metadata parsing + data access)
+//! The benchmark helps understand the overhead of IPC deserialization
+//! and serialization relative to actual query execution, and how filter
+//! performance scales with data size.
 //!
 //! ## Running the benchmark
 //!
 //! ```bash
 //! # Run all configurations
-//! cargo bench --bench deser -p datafusion-physical-plan
+//! cargo bench --bench filter_bench -p datafusion-physical-plan
 //!
-//! # Run only the standard deserialization benchmark
-//! cargo bench --bench deser -p datafusion-physical-plan -- deserialize_standard
+//! # Run with fewer samples for quick testing
+//! cargo bench --bench filter_bench -p datafusion-physical-plan -- --sample-size 10
 //!
-//! # Run only the zero-copy deserialization benchmark
-//! cargo bench --bench deser -p datafusion-physical-plan -- deserialize_zero_copy
+//! # Run only the deser_only benchmark
+//! cargo bench --bench filter_bench -p datafusion-physical-plan -- deser_only
 //!
 //! # Change measurement time (per benchmark, default is 5 seconds)
-//! cargo bench --bench deser -p datafusion-physical-plan -- --measurement-time 10
+//! cargo bench --bench filter_bench -p datafusion-physical-plan -- --measurement-time 10
 //!
 //! # Run specific configuration
-//! cargo bench --bench deser -p datafusion-physical-plan -- "1M_rows_binary_10B"
+//! cargo bench --bench filter_bench -p datafusion-physical-plan -- "1M_rows_binary_10B"
 //! ```
 //!
 //! ## Baseline Management
 //!
+//! Criterion stores benchmark results in `target/criterion/` and automatically compares
+//! new runs against previous results. Each benchmark has three states:
+//! - **base/**: The baseline for comparison (saved with --save-baseline)
+//! - **new/**: The most recent benchmark run
+//! - **change/**: Statistics about the change from base to new
+//!
 //! ```bash
-//! # Save current results as a named baseline
-//! cargo bench --bench deser -p datafusion-physical-plan -- --save-baseline my-baseline
+//! # Save current results as a named baseline (e.g., "main" or "before-optimization")
+//! cargo bench --bench filter_bench -p datafusion-physical-plan -- --save-baseline my-baseline
 //!
 //! # Compare against a specific baseline
-//! cargo bench --bench deser -p datafusion-physical-plan -- --baseline my-baseline
+//! cargo bench --bench filter_bench -p datafusion-physical-plan -- --baseline my-baseline
+//!
+//! # List all saved baselines (stored in target/criterion/<benchmark-name>/<test-name>/)
+//! ls target/criterion/filter_bench/deser_only/1M_rows_binary_10B/
 //!
 //! # Delete all benchmark history and start fresh
 //! rm -rf target/criterion
+//!
+//! # Run without saving results (useful for quick checks)
+//! cargo bench --bench filter_bench -p datafusion-physical-plan -- --profile-time 1
 //! ```
+//!
+//! **Typical workflow for tracking performance:**
+//! 1. Before making changes: `cargo bench --bench filter_bench -- --save-baseline before`
+//! 2. Make your code changes
+//! 3. Compare: `cargo bench --bench filter_bench -- --baseline before`
+//! 4. Criterion will show % change from the "before" baseline
 
-// Include shared benchmark utilities
+// Include shared benchmark utilitiesi
 #[path = "bench_utils.rs"]
 mod bench_utils;
 
 use std::hint::black_box;
 use std::sync::Arc;
-
-use arrow::buffer::Buffer;
+use arrow::array::RecordBatch;
+use arrow::datatypes::SchemaRef;
 use criterion::{
-    BenchmarkId, Criterion, SamplingMode, Throughput, criterion_group, criterion_main,
+    BatchSize, BenchmarkId, Criterion, SamplingMode, Throughput, criterion_group, criterion_main,
 };
+use datafusion_physical_expr::PhysicalExpr;
+use datafusion_physical_plan::{ExecutionPlan, collect};
+use tokio::runtime::Runtime;
 
 use bench_utils::{
-    FunctionalBatchGenerator, create_schema, deserialize_from_ipc, serialize_to_ipc,
+    FunctionalBatchGenerator, create_schema, deserialize_from_ipc, serialize_to_ipc
 };
 
 // ============================================================================
 // Benchmark Implementation
 // ============================================================================
 
-/// Benchmarks standard IPC deserialization (with data copying).
+/// Main benchmark function for filter execution.
 ///
-/// This measures the cost of Arrow IPC deserialization using the standard
-/// approach where data may be copied during the deserialization process.
-/// This is the typical deserialization path when reading from files or
-/// network streams.
-fn bench_deserialize_standard(c: &mut Criterion) {
-    let mut group = c.benchmark_group("deserialize_standard");
+/// This benchmark measures four scenarios for each binary column size:
+///
+/// 1. **deser_only**: Just IPC deserialization, no execution
+///    - Establishes baseline deserialization cost
+///    - Useful for understanding I/O vs compute ratio
+fn bench_deser(c: &mut Criterion) {
+    // Create a Tokio runtime for async execution
+    let rt = Runtime::new().unwrap();
+    let mut group = c.benchmark_group("filter_bench");
 
     // Use flat sampling to collect exactly the requested samples without time constraints
     group.sampling_mode(SamplingMode::Flat);
+
+    // Set measurement time (default is 5 seconds)
+    // Uncomment and adjust the duration as needed:
+    // group.measurement_time(std::time::Duration::from_secs(10));
 
     // Configuration: 1M rows total (10K rows × 100 batches)
     let rows_per_batch = 10_000;
     let num_batches = 100;
     let total_rows = rows_per_batch * num_batches;
 
-    // Test different binary column sizes to understand deserialization overhead
-    let binary_sizes = vec![10, 1024, 2048];
+    // Test different binary column sizes to understand serialization overhead
+    let binary_sizes = vec![2048];
 
     for binary_size in binary_sizes {
         let label = format!("1M_rows_binary_{binary_size}B");
 
         // Generate test data and serialize to IPC format
         let schema = create_schema();
-        let mut generator = FunctionalBatchGenerator::new(
-            Arc::clone(&schema),
-            rows_per_batch,
-            num_batches,
-            binary_size,
-        );
-        let batches = generator.generate_batches();
-        let ipc_data = serialize_to_ipc(&batches, &schema);
+
+        let (batches, ipc_data, ipc_size) = create_input(rows_per_batch, num_batches, total_rows, binary_size, &schema);
 
         // Set throughput metric for bytes/second calculations
-        group.throughput(Throughput::Bytes(ipc_data.len() as u64));
+        group.throughput(Throughput::Bytes(ipc_size as u64));
 
-        // Log configuration
-        println!(
-            "Config (standard): {} rows, binary_size={} bytes, IPC size={:.2} MB",
-            total_rows,
-            binary_size,
-            ipc_data.len() as f64 / (1024.0 * 1024.0)
-        );
-
+        // Benchmark 1: IPC Deserialization only
+        // Measures the cost of parsing Arrow IPC format into RecordBatches
         group.bench_with_input(
-            BenchmarkId::from_parameter(&label),
+            BenchmarkId::new("deser_only", &label),
             &ipc_data,
             |b, ipc_data| {
                 b.iter(|| {
@@ -141,6 +155,26 @@ fn bench_deserialize_standard(c: &mut Criterion) {
     group.finish();
 }
 
+fn create_input(rows_per_batch: usize, num_batches: usize, total_rows: usize, binary_size: usize, schema: &SchemaRef) -> (Vec<RecordBatch>, Vec<u8>, usize) {
+    let mut generator = FunctionalBatchGenerator::new(
+        Arc::clone(&schema),
+        rows_per_batch,
+        num_batches,
+        binary_size,
+    );
+    let batches = generator.generate_batches();
+    let ipc_data = serialize_to_ipc(&batches, &schema);
+    let ipc_size = ipc_data.len();
 
-criterion_group!(benches, bench_deserialize_standard);
+    // Log configuration for visibility in benchmark output
+    println!(
+        "Config: {} rows, binary_size={} bytes, IPC size={:.2} MB",
+        total_rows,
+        binary_size,
+        ipc_size as f64 / (1024.0 * 1024.0)
+    );
+    (batches, ipc_data, ipc_size)
+}
+
+criterion_group!(benches, bench_deser);
 criterion_main!(benches);
