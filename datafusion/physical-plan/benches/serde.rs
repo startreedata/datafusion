@@ -17,17 +17,6 @@
 
 //! Benchmark for Arrow IPC serialization performance.
 //!
-//! This benchmark measures the overhead of serializing RecordBatches to Arrow IPC format,
-//! comparing two approaches:
-//!
-//! 1. **serialize_to_sink**: Writes to a sink that discards data (measures pure CPU cost)
-//! 2. **serialize_to_ipc**: Writes to a Vec<u8> (includes memory allocation overhead)
-//!
-//! The benchmark helps understand:
-//! - Pure serialization CPU cost vs. memory allocation overhead
-//! - How serialization performance scales with data size and binary column sizes
-//! - Cost of IPC format encoding (metadata + data alignment)
-//!
 //! ## Running the benchmark
 //!
 //! ```bash
@@ -75,19 +64,18 @@ use criterion::{
 };
 
 use bench_utils::{
-    FunctionalBatchGenerator, create_schema, serialize_results_to_ipc,
+    FunctionalBatchGenerator, create_schema, serialize_batches_to_sink
 };
 
 // ============================================================================
 // Benchmark Implementation
 // ============================================================================
 
-
-/// Benchmarks serialization to memory (Vec<u8>).
+/// Benchmarks serialization to a sink that drops all data.
 ///
-/// This measures the full cost of Arrow IPC serialization including
-/// memory allocation overhead. This is what happens in real-world
-/// scenarios when sending data over a network or writing to storage.
+/// This measures the pure CPU cost of Arrow IPC serialization without
+/// including memory allocation or I/O overhead. Useful for understanding
+/// the baseline serialization cost.
 fn bench_serialize(c: &mut Criterion) {
     let mut group = c.benchmark_group("serialize");
 
@@ -123,7 +111,7 @@ fn bench_serialize(c: &mut Criterion) {
 
         // Log configuration
         println!(
-            "Config (memory): {} rows, binary_size={} bytes, estimated output={:.2} MB",
+            "Config (sink): {} rows, binary_size={} bytes, estimated output={:.2} MB",
             total_rows,
             binary_size,
             expected_size as f64 / (1024.0 * 1024.0)
@@ -134,9 +122,9 @@ fn bench_serialize(c: &mut Criterion) {
             &batches,
             |b, batches| {
                 b.iter(|| {
-                    let ipc_data = serialize_results_to_ipc(batches);
+                    let bytes_written = serialize_batches_to_sink(batches, &schema);
                     // black_box prevents compiler from optimizing away unused results
-                    black_box(ipc_data)
+                    black_box(bytes_written)
                 })
             },
         );

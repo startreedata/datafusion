@@ -17,17 +17,6 @@
 
 //! Benchmark for Arrow IPC deserialization performance.
 //!
-//! This benchmark measures the overhead of deserializing Arrow IPC data into RecordBatches,
-//! comparing two approaches:
-//!
-//! 1. **deserialize_from_ipc**: Standard deserialization that copies data
-//! 2. **deserialize_zero_copy**: Zero-copy deserialization using Buffer slicing
-//!
-//! The benchmark helps understand:
-//! - Standard deserialization cost vs. zero-copy deserialization
-//! - How deserialization performance scales with data size and binary column sizes
-//! - Cost of IPC format decoding (metadata parsing + data access)
-//!
 //! ## Running the benchmark
 //!
 //! ```bash
@@ -73,20 +62,23 @@ use criterion::{
 };
 
 use bench_utils::{
-    FunctionalBatchGenerator, create_schema, deserialize_from_ipc, serialize_to_ipc,
+    FunctionalBatchGenerator, create_schema, deserialize_zero_copy, serialize_to_ipc,
 };
 
 // ============================================================================
 // Benchmark Implementation
 // ============================================================================
 
-/// Benchmarks standard IPC deserialization (with data copying).
+/// Benchmarks zero-copy IPC deserialization.
 ///
-/// This measures the cost of Arrow IPC deserialization using the standard
-/// approach where data may be copied during the deserialization process.
-/// This is the typical deserialization path when reading from files or
-/// network streams.
-fn bench_deserialize_standard(c: &mut Criterion) {
+/// This measures the cost of Arrow IPC deserialization using zero-copy
+/// techniques where Arrow arrays reference the original buffer directly
+/// via Buffer slicing. This avoids copying the actual data and only
+/// creates lightweight views into the existing buffer.
+///
+/// This is the most efficient deserialization approach when you have
+/// a contiguous buffer (e.g., mmap'd file or received network buffer).
+fn bench_deserialize(c: &mut Criterion) {
     let mut group = c.benchmark_group("deserialize_standard");
 
     // Use flat sampling to collect exactly the requested samples without time constraints
@@ -114,23 +106,26 @@ fn bench_deserialize_standard(c: &mut Criterion) {
         let batches = generator.generate_batches();
         let ipc_data = serialize_to_ipc(&batches, &schema);
 
+        // Convert to Buffer for zero-copy deserialization
+        let buffer = Buffer::from_vec(ipc_data);
+
         // Set throughput metric for bytes/second calculations
-        group.throughput(Throughput::Bytes(ipc_data.len() as u64));
+        group.throughput(Throughput::Bytes(buffer.len() as u64));
 
         // Log configuration
         println!(
-            "Config (standard): {} rows, binary_size={} bytes, IPC size={:.2} MB",
+            "Config (zero-copy): {} rows, binary_size={} bytes, IPC size={:.2} MB",
             total_rows,
             binary_size,
-            ipc_data.len() as f64 / (1024.0 * 1024.0)
+            buffer.len() as f64 / (1024.0 * 1024.0)
         );
 
         group.bench_with_input(
             BenchmarkId::from_parameter(&label),
-            &ipc_data,
-            |b, ipc_data| {
+            &buffer,
+            |b, buffer| {
                 b.iter(|| {
-                    let (schema, batches) = deserialize_from_ipc(ipc_data);
+                    let (schema, batches) = deserialize_zero_copy(buffer);
                     // black_box prevents compiler from optimizing away unused results
                     black_box((schema, batches))
                 })
@@ -141,6 +136,5 @@ fn bench_deserialize_standard(c: &mut Criterion) {
     group.finish();
 }
 
-
-criterion_group!(benches, bench_deserialize_standard);
+criterion_group!(benches, bench_deserialize);
 criterion_main!(benches);

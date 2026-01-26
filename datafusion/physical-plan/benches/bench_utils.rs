@@ -20,16 +20,19 @@
 //! This module provides common functionality for benchmarks that measure
 //! Arrow IPC deserialization combined with DataFusion execution plans.
 
-use std::io::Cursor;
+use std::io::Write;
 use std::sync::Arc;
 
 use arrow::array::{
     ArrayRef, BinaryArray, Float32Array, Float64Array, Int32Array, Int64Array,
     RecordBatch, StringArray,
 };
+use arrow::buffer::Buffer;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
-use arrow::ipc::reader::StreamReader;
-use arrow::ipc::writer::StreamWriter;
+use arrow::ipc::convert::fb_to_schema;
+use arrow::ipc::reader::{FileDecoder, read_footer_length};
+use arrow::ipc::writer::FileWriter;
+use arrow::ipc::root_as_footer;
 use datafusion_execution::TaskContext;
 use datafusion_physical_expr::EquivalenceProperties;
 use datafusion_physical_plan::execution_plan::{Boundedness, EmissionType};
@@ -381,10 +384,10 @@ impl SingleColumnBatchGenerator {
 // Arrow IPC Serialization / Deserialization
 // ============================================================================
 
-/// Serializes record batches to Arrow IPC stream format (in-memory).
+/// Serializes record batches to Arrow IPC file format (in-memory).
 ///
 /// This simulates receiving Arrow data over a network or reading from storage.
-/// The IPC format is Arrow's standard binary interchange format.
+/// Uses the IPC file format (with footer) to enable zero-copy deserialization.
 ///
 /// # Arguments
 /// * `batches` - Record batches to serialize
@@ -395,7 +398,7 @@ impl SingleColumnBatchGenerator {
 pub fn serialize_to_ipc(batches: &[RecordBatch], schema: &SchemaRef) -> Vec<u8> {
     let mut buffer = Vec::new();
     {
-        let mut writer = StreamWriter::try_new(&mut buffer, schema).unwrap();
+        let mut writer = FileWriter::try_new(&mut buffer, schema).unwrap();
         for batch in batches {
             writer.write(batch).unwrap();
         }
@@ -404,21 +407,47 @@ pub fn serialize_to_ipc(batches: &[RecordBatch], schema: &SchemaRef) -> Vec<u8> 
     buffer
 }
 
-/// Deserializes record batches from Arrow IPC stream format.
+/// Deserializes record batches from Arrow IPC file format using zero-copy.
 ///
 /// This is the operation being benchmarked - converting serialized Arrow IPC
 /// data back into in-memory record batches that can be processed by DataFusion.
 ///
+/// Zero-copy means the Arrow arrays refer directly to the provided buffer,
+/// avoiding memory copying during deserialization.
+///
 /// # Arguments
-/// * `data` - Serialized IPC data
+/// * `buffer` - Serialized IPC data
 ///
 /// # Returns
 /// Tuple of (schema, batches) extracted from the IPC data
-pub fn deserialize_from_ipc(data: &[u8]) -> (SchemaRef, Vec<RecordBatch>) {
-    let cursor = Cursor::new(data);
-    let reader = StreamReader::try_new(cursor, None).unwrap();
-    let schema = reader.schema();
-    let batches: Vec<RecordBatch> = reader.map(|r| r.expect("Failed to read batch")).collect();
+pub fn deserialize_zero_copy(buffer: &Buffer) -> (SchemaRef, Vec<RecordBatch>) {
+    // Read the footer to get schema and batch locations
+    let trailer_start = buffer.len() - 10;
+    let footer_len = read_footer_length(buffer[trailer_start..].try_into().unwrap()).unwrap();
+    let footer = root_as_footer(&buffer[trailer_start - footer_len..trailer_start]).unwrap();
+
+    let schema = Arc::new(fb_to_schema(footer.schema().unwrap()));
+    let mut decoder = FileDecoder::new(Arc::clone(&schema), footer.version());
+
+    // Read dictionaries if present
+    for block in footer.dictionaries().iter().flatten() {
+        let block_len = block.bodyLength() as usize + block.metaDataLength() as usize;
+        let data = buffer.slice_with_length(block.offset() as _, block_len);
+        decoder.read_dictionary(block, &data).unwrap();
+    }
+
+    // Read all record batches
+    let mut batches = Vec::new();
+    if let Some(batch_blocks) = footer.recordBatches() {
+        for block in batch_blocks {
+            let block_len = block.bodyLength() as usize + block.metaDataLength() as usize;
+            let data = buffer.slice_with_length(block.offset() as _, block_len);
+            if let Some(batch) = decoder.read_record_batch(&block, &data).unwrap() {
+                batches.push(batch);
+            }
+        }
+    }
+
     (schema, batches)
 }
 
@@ -438,6 +467,97 @@ pub fn serialize_results_to_ipc(batches: &[RecordBatch]) -> Vec<u8> {
     }
     let schema = batches[0].schema();
     serialize_to_ipc(batches, &schema)
+}
+
+/// A writer that discards all data written to it.
+///
+/// This is useful for benchmarking serialization overhead without
+/// including actual I/O or memory allocation costs.
+struct SinkWriter {
+    bytes_written: usize,
+}
+
+impl SinkWriter {
+    fn new() -> Self {
+        Self { bytes_written: 0 }
+    }
+
+    /// Returns the total number of bytes that would have been written.
+    fn bytes_written(&self) -> usize {
+        self.bytes_written
+    }
+}
+
+impl Write for SinkWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.bytes_written += buf.len();
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Serializes a record batch to a sink that drops all data.
+///
+/// This function measures pure serialization overhead by writing to a sink
+/// that discards data instead of allocating memory or performing I/O.
+/// Useful for benchmarking the CPU cost of serialization alone.
+///
+/// # Arguments
+/// * `batch` - The record batch to serialize
+///
+/// # Returns
+/// The number of bytes that would have been written
+///
+/// # Example
+/// ```ignore
+/// let batch = create_test_batch();
+/// let bytes_written = serialize_to_sink(&batch);
+/// println!("Serialization would write {} bytes", bytes_written);
+/// ```
+pub fn serialize_to_sink(batch: &RecordBatch) -> usize {
+    let schema = batch.schema();
+    let mut sink = SinkWriter::new();
+    {
+        let mut writer = FileWriter::try_new(&mut sink, &schema).unwrap();
+        writer.write(batch).unwrap();
+        writer.finish().unwrap();
+    }
+    sink.bytes_written()
+}
+
+/// Serializes multiple record batches to a sink that drops all data.
+///
+/// This function measures pure serialization overhead by writing to a sink
+/// that discards data instead of allocating memory or performing I/O.
+/// Useful for benchmarking the CPU cost of serialization alone.
+///
+/// # Arguments
+/// * `batches` - The record batches to serialize
+/// * `schema` - The schema for the batches
+///
+/// # Returns
+/// The number of bytes that would have been written
+///
+/// # Example
+/// ```ignore
+/// let batches = create_test_batches();
+/// let schema = batches[0].schema();
+/// let bytes_written = serialize_batches_to_sink(&batches, &schema);
+/// println!("Serialization would write {} bytes", bytes_written);
+/// ```
+pub fn serialize_batches_to_sink(batches: &[RecordBatch], schema: &SchemaRef) -> usize {
+    let mut sink = SinkWriter::new();
+    {
+        let mut writer = FileWriter::try_new(&mut sink, schema).unwrap();
+        for batch in batches {
+            writer.write(batch).unwrap();
+        }
+        writer.finish().unwrap();
+    }
+    sink.bytes_written()
 }
 
 // ============================================================================
