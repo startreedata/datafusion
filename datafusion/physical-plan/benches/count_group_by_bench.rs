@@ -54,6 +54,7 @@ mod bench_utils;
 use std::hint::black_box;
 use std::sync::Arc;
 
+use arrow::buffer::Buffer;
 use criterion::{
     BatchSize, BenchmarkId, Criterion, SamplingMode, Throughput, criterion_group, criterion_main,
 };
@@ -66,7 +67,7 @@ use datafusion_physical_plan::aggregates::{AggregateExec, AggregateMode, Physica
 use datafusion_physical_plan::{ExecutionPlan, collect};
 
 use bench_utils::{
-    BatchSourceExec, SingleColumnBatchGenerator, SingleColumnType, deserialize_from_ipc,
+    BatchSourceExec, SingleColumnBatchGenerator, SingleColumnType, deserialize_zero_copy,
     serialize_results_to_ipc, serialize_to_ipc,
 };
 
@@ -242,16 +243,18 @@ fn bench_count_group_by(c: &mut Criterion) {
                 },
             );
 
+            let data_buffer = Buffer::from_vec(ipc_data);
+
             // Benchmark 2: Full pipeline (deser + aggregation + output serialization)
             // Measures complete round-trip: IPC in -> aggregate -> IPC out
             // Relevant for scenarios where results are sent over network or stored
             group.bench_with_input(
                 BenchmarkId::new("full_pipeline", &label),
-                &ipc_data,
-                |b, ipc_data| {
+                &data_buffer,
+                |b, data_buffer| {
                     b.iter(|| {
                         rt.block_on(async {
-                            let (schema, batches) = deserialize_from_ipc(ipc_data);
+                            let (schema, batches) = deserialize_zero_copy(data_buffer);
                             let source = Arc::new(BatchSourceExec::new(
                                 Arc::clone(&schema),
                                 batches,
