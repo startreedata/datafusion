@@ -19,7 +19,7 @@
 //!
 //! This benchmark measures the end-to-end latency of:
 //! 1. Deserializing Arrow IPC data into RecordBatches
-//! 2. Executing a FilterExec operator (predicate: colInt > 0)
+//! 2. Executing a FilterExec operator (predicate: colInt > 2500)
 //! 3. Serializing the output back to Arrow IPC format
 //!
 //! The benchmark helps understand the overhead of IPC deserialization
@@ -104,10 +104,10 @@ use bench_utils::{
 // Filter Plan Creation
 // ============================================================================
 
-/// Creates a FilterExec that evaluates `colInt > 0`.
+/// Creates a FilterExec that evaluates `colInt > 2500`.
 ///
 /// With the data generation pattern `colInt = i % 5000`, this predicate
-/// has low selectivity.
+/// has approximately 50% selectivity (values 2501-4999 pass, 0-2500 don't).
 ///
 /// # Arguments
 /// * `input` - The input execution plan (typically BatchSourceExec)
@@ -119,11 +119,11 @@ fn create_filter_plan(
     input: Arc<dyn ExecutionPlan>,
     schema: &SchemaRef,
 ) -> Arc<dyn ExecutionPlan> {
-    // Build the predicate: colInt > 0
+    // Build the predicate: colInt > 2500
     let col_int = Arc::new(Column::new_with_schema("colInt", schema).unwrap())
         as Arc<dyn PhysicalExpr>;
     let threshold =
-        Arc::new(Literal::new(ScalarValue::Int32(Some(0)))) as Arc<dyn PhysicalExpr>;
+        Arc::new(Literal::new(ScalarValue::Int32(Some(2500)))) as Arc<dyn PhysicalExpr>;
     let predicate =
         Arc::new(BinaryExpr::new(col_int, Operator::Gt, threshold)) as Arc<dyn PhysicalExpr>;
 
