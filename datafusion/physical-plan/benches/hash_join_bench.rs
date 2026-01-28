@@ -173,7 +173,7 @@ fn bench_hash_join(c: &mut Criterion) {
 
     // Probe side configuration: 1M rows total (10K rows × 100 batches)
     let rows_per_batch = 10_000;
-    let num_batches = 100;
+    let num_batches = 1;
     let total_probe_rows = rows_per_batch * num_batches;
 
     // Generate all benchmark configurations
@@ -241,34 +241,34 @@ fn bench_hash_join(c: &mut Criterion) {
 
         // Benchmark 1: Join execution only
         // Uses pre-generated batches directly, isolating HashJoinExec performance
-        group.bench_with_input(
-            BenchmarkId::new("join_only", &label),
-            &(&probe_batches, &build_batches),
-            |b, (probe_batches, build_batches)| {
-                b.iter_batched(
-                    // Setup: clone batches (NOT timed) - needed because execution consumes them
-                    || ((*probe_batches).clone(), (*build_batches).clone()),
-                    // Benchmark: execute join (TIMED)
-                    |(probe_batches, build_batches)| {
-                        rt.block_on(async {
-                            let probe_source = Arc::new(BatchSourceExec::new(
-                                Arc::clone(&probe_schema),
-                                probe_batches,
-                            )) as Arc<dyn ExecutionPlan>;
-                            let build_source = Arc::new(BatchSourceExec::new(
-                                Arc::clone(&build_schema),
-                                build_batches,
-                            )) as Arc<dyn ExecutionPlan>;
-                            let plan = create_hash_join_plan(probe_source, build_source);
-                            let task_ctx = Arc::new(TaskContext::default());
-                            let results = collect(plan, task_ctx).await.unwrap();
-                            black_box(results)
-                        })
-                    },
-                    BatchSize::SmallInput,
-                )
-            },
-        );
+        // group.bench_with_input(
+        //     BenchmarkId::new("join_only", &label),
+        //     &(&probe_batches, &build_batches),
+        //     |b, (probe_batches, build_batches)| {
+        //         b.iter_batched(
+        //             // Setup: clone batches (NOT timed) - needed because execution consumes them
+        //             || ((*probe_batches).clone(), (*build_batches).clone()),
+        //             // Benchmark: execute join (TIMED)
+        //             |(probe_batches, build_batches)| {
+        //                 rt.block_on(async {
+        //                     let probe_source = Arc::new(BatchSourceExec::new(
+        //                         Arc::clone(&probe_schema),
+        //                         probe_batches,
+        //                     )) as Arc<dyn ExecutionPlan>;
+        //                     let build_source = Arc::new(BatchSourceExec::new(
+        //                         Arc::clone(&build_schema),
+        //                         build_batches,
+        //                     )) as Arc<dyn ExecutionPlan>;
+        //                     let plan = create_hash_join_plan(probe_source, build_source);
+        //                     let task_ctx = Arc::new(TaskContext::default());
+        //                     let results = collect(plan, task_ctx).await.unwrap();
+        //                     black_box(results)
+        //                 })
+        //             },
+        //             BatchSize::SmallInput,
+        //         )
+        //     },
+        // );
 
         // Convert to Buffer for zero-copy deserialization
         let probe_buffer = Buffer::from_vec(probe_ipc_data.clone());
