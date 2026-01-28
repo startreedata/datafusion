@@ -90,6 +90,17 @@ pub fn create_binary_column_schema() -> SchemaRef {
     )]))
 }
 
+/// Creates a single-column schema with an Int32 column named "colInt".
+///
+/// Used for join benchmarks where the build side has only the join key column.
+pub fn create_join_build_schema() -> SchemaRef {
+    Arc::new(Schema::new(vec![Field::new(
+        "colInt",
+        DataType::Int32,
+        false,
+    )]))
+}
+
 // ============================================================================
 // Data Generation
 // ============================================================================
@@ -377,6 +388,89 @@ impl SingleColumnBatchGenerator {
     /// `rows_per_batch` rows with values randomly selected from `distinct_count` unique values.
     pub fn generate_batches(&mut self) -> Vec<RecordBatch> {
         (0..self.num_batches).map(|_| self.generate_batch()).collect()
+    }
+}
+
+// ============================================================================
+// Join Build Side Data Generation
+// ============================================================================
+
+/// Generates single-column record batches for the build side of join benchmarks.
+///
+/// This generator creates data with controlled match rates and key repetition patterns,
+/// useful for testing JOIN performance at different selectivities. The generated data
+/// is typically used as the build side (hash table) in hash joins.
+///
+/// Data patterns:
+/// - Generates integers from 0 to `(match_rate * 5000) - 1`
+/// - Each distinct key is repeated `repeated_keys` times
+/// - Total rows = `(match_rate * 5000) * repeated_keys`
+/// - Sequential/deterministic: 0, 0, ..., 0, 1, 1, ..., 1, etc.
+pub struct JoinBuildSideGenerator {
+    /// Schema for generated batches (single colInt column)
+    schema: SchemaRef,
+    /// Match rate (0.5 or 1.0) - determines the range of keys
+    match_rate: f64,
+    /// Number of times each key is repeated
+    repeated_keys: usize,
+}
+
+impl JoinBuildSideGenerator {
+    /// Creates a new join build side generator.
+    ///
+    /// # Arguments
+    /// * `match_rate` - Fraction of probe-side keys that will match (0.5 or 1.0)
+    /// * `repeated_keys` - Number of times each distinct key appears
+    ///
+    /// # Returns
+    /// A new generator configured for the specified match rate and repetition.
+    pub fn new(match_rate: f64, repeated_keys: usize) -> Self {
+        let schema = create_join_build_schema();
+        Self {
+            schema,
+            match_rate,
+            repeated_keys,
+        }
+    }
+
+    /// Returns the schema of the generated batches.
+    pub fn schema(&self) -> SchemaRef {
+        Arc::clone(&self.schema)
+    }
+
+    /// Returns the number of distinct keys that will be generated.
+    pub fn distinct_keys(&self) -> usize {
+        (self.match_rate * 5000.0) as usize
+    }
+
+    /// Returns the total number of rows that will be generated.
+    pub fn total_rows(&self) -> usize {
+        self.distinct_keys() * self.repeated_keys
+    }
+
+    /// Generates all batches for the build side of the join.
+    ///
+    /// Creates a single batch containing all rows. Each key from 0 to
+    /// `(match_rate * 5000) - 1` appears `repeated_keys` times consecutively.
+    ///
+    /// Example with match_rate=0.5 (2500 keys) and repeated_keys=2:
+    /// `[0, 0, 1, 1, 2, 2, ..., 2499, 2499]`
+    pub fn generate_batches(&self) -> Vec<RecordBatch> {
+        let distinct_keys = self.distinct_keys();
+        let total_rows = self.total_rows();
+
+        // Generate values: each key from 0 to distinct_keys-1 repeated repeated_keys times
+        let values: Vec<i32> = (0..distinct_keys)
+            .flat_map(|key| std::iter::repeat(key as i32).take(self.repeated_keys))
+            .collect();
+
+        assert_eq!(values.len(), total_rows);
+
+        let column: ArrayRef = Arc::new(Int32Array::from(values));
+        let batch = RecordBatch::try_new(Arc::clone(&self.schema), vec![column])
+            .expect("Failed to create record batch");
+
+        vec![batch]
     }
 }
 

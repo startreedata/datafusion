@@ -126,5 +126,9 @@ name = "count_group_by_bench"
 
 [[bench]]
 harness = false
+name = "hash_join_bench"
+
+[[bench]]
+harness = false
 name = "distinct_group_by_bench"
 
