@@ -51,15 +51,15 @@
 #[path = "bench_utils.rs"]
 mod bench_utils;
 
+use std::fs::File;
 use std::hint::black_box;
+use std::path::PathBuf;
 use std::sync::Arc;
 
-use arrow::array::{ArrayRef, BinaryArray, Int32Array, RecordBatch};
-use arrow::buffer::Buffer;
-use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
-use criterion::{
-    BatchSize, BenchmarkId, Criterion, SamplingMode, Throughput, criterion_group, criterion_main,
-};
+use arrow::array::{RecordBatch, ArrayRef, BinaryArray, BinaryViewArray};
+use arrow::datatypes::SchemaRef;
+use arrow::ipc::reader::FileReader;
+use criterion::{BenchmarkId, Criterion, SamplingMode, Throughput, criterion_group, criterion_main};
 use datafusion_execution::TaskContext;
 use datafusion_functions_aggregate::count::count_udaf;
 use datafusion_physical_expr::aggregate::AggregateExprBuilder;
@@ -68,121 +68,17 @@ use datafusion_physical_expr::PhysicalExpr;
 use datafusion_physical_plan::aggregates::{AggregateExec, AggregateMode, PhysicalGroupBy};
 use datafusion_physical_plan::{ExecutionPlan, collect};
 
-use bench_utils::{BatchSourceExec, deserialize_zero_copy, serialize_results_to_ipc, serialize_to_ipc};
-
-// ============================================================================
-// Two-Column Data Generation (Int + Binary)
-// ============================================================================
-
-/// Generates two-column record batches for COUNT(DISTINCT bytes) GROUP BY colInt benchmarks.
-///
-/// This generator creates data following the Java IntBytesGenerator logic:
-/// - colInt: i % numGroups
-/// - bytes: ByteBuffer of bytesLength with int value (i % numGroups) at position 0,
-///   followed by zeros to fill remaining bytes
-///
-/// This ensures that:
-/// - There are exactly `numGroups` distinct values for colInt (0 to numGroups-1)
-/// - Each group (colInt value) has exactly 1 distinct bytes value
-/// - The bytes values vary in size (10 or 1000 bytes) to test size impact
-pub struct TwoColumnBatchGenerator {
-    /// Schema for generated batches (colInt: Int32, bytes: Binary)
-    schema: SchemaRef,
-    /// Number of rows in each batch
-    rows_per_batch: usize,
-    /// Total number of batches to generate
-    num_batches: usize,
-    /// Number of groups (modulo value for colInt)
-    num_groups: usize,
-    /// Size of binary values in bytes
-    bytes_length: usize,
-}
-
-impl TwoColumnBatchGenerator {
-    /// Creates a new two-column batch generator.
-    ///
-    /// # Arguments
-    /// * `rows_per_batch` - Number of rows per batch
-    /// * `num_batches` - Total number of batches to generate
-    /// * `num_groups` - Number of distinct groups (colInt values)
-    /// * `bytes_length` - Length of binary values (10 or 1000)
-    ///
-    /// # Returns
-    /// A new generator configured for the specified parameters.
-    pub fn new(
-        rows_per_batch: usize,
-        num_batches: usize,
-        num_groups: usize,
-        bytes_length: usize,
-    ) -> Self {
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("colInt", DataType::Int32, false),
-            Field::new("bytes", DataType::Binary, false),
-        ]));
-
-        Self {
-            schema,
-            rows_per_batch,
-            num_batches,
-            num_groups,
-            bytes_length,
-        }
-    }
-
-    /// Returns the schema of the generated batches.
-    pub fn schema(&self) -> SchemaRef {
-        Arc::clone(&self.schema)
-    }
-
-    /// Generates a single record batch for the given batch index.
-    ///
-    /// Follows Java's IntBytesGenerator logic:
-    /// - colInt[i] = (batch_start + i) % numGroups
-    /// - bytes[i] = ByteBuffer with int value ((batch_start + i) % numGroups) + zero padding
-    fn generate_batch(&self, batch_index: usize) -> RecordBatch {
-        let start_row = batch_index * self.rows_per_batch;
-        let num_rows = self.rows_per_batch;
-
-        // Generate colInt values: i % numGroups
-        let col_int_values: Vec<i32> = (0..num_rows)
-            .map(|i| ((start_row + i) % self.num_groups) as i32)
-            .collect();
-        let col_int_array = Arc::new(Int32Array::from(col_int_values)) as ArrayRef;
-
-        // Generate bytes values: ByteBuffer with int at start + zero padding
-        // Follows Java's: ByteBuffer.allocate(bytesLength).putInt(i % numGroups)
-        let bytes_values: Vec<Vec<u8>> = (0..num_rows)
-            .map(|i| {
-                let group_id = ((start_row + i) % self.num_groups) as i32;
-                let mut buffer = vec![0u8; self.bytes_length];
-                // Write the int value at the start (little-endian, matching Java's ByteBuffer)
-                buffer[0..4].copy_from_slice(&group_id.to_le_bytes());
-                buffer
-            })
-            .collect();
-        let bytes_refs: Vec<&[u8]> = bytes_values.iter().map(|v| v.as_slice()).collect();
-        let bytes_array = Arc::new(BinaryArray::from(bytes_refs)) as ArrayRef;
-
-        RecordBatch::try_new(Arc::clone(&self.schema), vec![col_int_array, bytes_array])
-            .expect("Failed to create record batch")
-    }
-
-    /// Generates all batches.
-    ///
-    /// Returns a vector of `num_batches` record batches, each containing
-    /// `rows_per_batch` rows.
-    pub fn generate_batches(&self) -> Vec<RecordBatch> {
-        (0..self.num_batches)
-            .map(|i| self.generate_batch(i))
-            .collect()
-    }
-}
+use bench_utils::{BatchSourceExec, serialize_results_to_ipc};
 
 // ============================================================================
 // Aggregate Plan Creation
 // ============================================================================
 
 /// Creates an AggregateExec that performs COUNT(DISTINCT bytes) GROUP BY colInt.
+///
+/// This benchmark doesn't generate data. Instead, we have to run the equivalent JMH benchmark in
+/// Apache Pinot and then copy the generated Arrow IPC files into the `benches/` folder, keeping
+/// the name conventions used in the JMH benchmark.
 ///
 /// This simulates a common aggregation pattern where we count the number of
 /// distinct binary values for each integer group value.
@@ -237,21 +133,64 @@ fn create_distinct_count_groupby_plan(input: Arc<dyn ExecutionPlan>) -> Arc<dyn 
 struct BenchConfig {
     /// Human-readable name for the configuration
     name: &'static str,
-    /// Size of binary values in bytes
+    /// Size of binary values in bytes (not used, but kept for compatibility)
+    #[allow(dead_code)]
     bytes_length: usize,
 }
 
-/// Main benchmark function for COUNT(DISTINCT bytes) GROUP BY colInt execution.
-///
-/// This benchmark measures COUNT(DISTINCT) GROUP BY performance across:
-/// - Different binary sizes (10B, 1000B)
-/// - Different cardinalities (4096, 16384, 65536 distinct groups)
-///
-/// For each configuration, we measure:
-/// - **agg_only**: Pure aggregation execution using pre-generated batches
-///   This isolates the AggregateExec performance from serialization overhead
-/// - **full_pipeline**: Complete deser + aggregation + output serialization
-///   Real-world end-to-end latency including IPC serde
+/// Enum to select which binary array type to use
+#[derive(Debug, Clone, Copy)]
+enum BinaryType {
+    Binary,
+    BinaryView,
+}
+
+fn get_arrow_file_path(
+    folder: &str,
+    config_name: &str,
+    num_groups: usize,
+    distinct_values_per_group: usize,
+) -> PathBuf {
+    let file_name = format!(
+        "group_distinct_by_{}_groups_{}_distinctPerGroup_{}.arrow",
+        config_name,
+        num_groups,
+        distinct_values_per_group
+    );
+    PathBuf::from(folder).join(file_name)
+}
+
+fn load_batches_from_arrow_file(path: &PathBuf, binary_type: BinaryType) -> (SchemaRef, Vec<RecordBatch>) {
+    let file = File::open(path).unwrap_or_else(|_| panic!("Arrow file not found: {}", path.display()));
+    let mut reader = FileReader::try_new(file, None).expect("Failed to open Arrow IPC file");
+    let orig_schema = reader.schema();
+    let orig_batches = reader.collect::<arrow::error::Result<Vec<_>>>().expect("Failed to read batches from Arrow file");
+
+    match binary_type {
+        BinaryType::Binary => (orig_schema, orig_batches),
+        BinaryType::BinaryView => {
+            // Find the index of the "bytes" column
+            let bytes_idx = orig_schema.fields().iter().position(|f| f.name() == "bytes").expect("No 'bytes' column");
+            // Create new schema with bytes as BinaryView
+            let mut new_fields: Vec<Arc<arrow::datatypes::Field>> = orig_schema.fields().to_vec();
+            new_fields[bytes_idx] = Arc::new(arrow::datatypes::Field::new("bytes", arrow::datatypes::DataType::BinaryView, false));
+            let new_schema = Arc::new(arrow::datatypes::Schema::new(
+                new_fields.iter().map(|f| f.as_ref().clone()).collect::<Vec<arrow::datatypes::Field>>()
+            ));
+            // Convert each batch
+            let new_batches = orig_batches.into_iter().map(|batch| {
+                let mut columns: Vec<ArrayRef> = batch.columns().to_vec();
+                let binary_array = batch.column(bytes_idx).as_any().downcast_ref::<BinaryArray>().expect("'bytes' column is not BinaryArray");
+                let binaryview_vec: Vec<&[u8]> = (0..batch.num_rows()).map(|i| binary_array.value(i)).collect();
+                let binaryview_array = BinaryViewArray::from(binaryview_vec);
+                columns[bytes_idx] = Arc::new(binaryview_array);
+                RecordBatch::try_new(Arc::clone(&new_schema), columns).expect("Failed to create BinaryView batch")
+            }).collect();
+            (new_schema, new_batches)
+        }
+    }
+}
+
 fn bench_distinct_group_by(c: &mut Criterion) {
     // Create a single-threaded Tokio runtime for async execution.
     // We use current_thread to ensure all async work runs on the benchmark thread,
@@ -259,15 +198,11 @@ fn bench_distinct_group_by(c: &mut Criterion) {
     let rt = tokio::runtime::Builder::new_current_thread()
         .build()
         .unwrap();
+
     let mut group = c.benchmark_group("distinct_group_by_bench");
 
     // Use flat sampling to collect exactly the requested samples without time constraints
     group.sampling_mode(SamplingMode::Flat);
-
-    // Configuration: 1M rows total (10K rows × 100 batches)
-    let rows_per_batch = 10_000;
-    let num_batches = 100;
-    let total_rows = rows_per_batch * num_batches;
 
     // Binary size configurations
     let configs = vec![
@@ -281,127 +216,107 @@ fn bench_distinct_group_by(c: &mut Criterion) {
         },
     ];
 
-    // Distinct keys configurations (number of groups)
-    let distinct_keys = vec![4096, 16384, 65536];
+    // Distinct values per group (JMH param)
+    let distinct_values_per_group_list = vec![1, 4, 16, 64, 256, 1024];
+
+    let binary_types = vec![BinaryType::Binary, BinaryType::BinaryView];
+
+    let arrow_folder = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("benches");
 
     for config in &configs {
-        for &num_groups in &distinct_keys {
-            let label = format!("{}/distinct_{}", config.name, num_groups);
+        for &binary_type in &binary_types {
+            let binary_type_label = match binary_type {
+                BinaryType::Binary => "Binary",
+                BinaryType::BinaryView => "BinaryView",
+            };
+            for &distinct_values_per_group in &distinct_values_per_group_list {
+                let num_groups = 512;
+                let num_batches = 1;
+                let rows_per_batch = num_groups * distinct_values_per_group;
+                let total_rows = rows_per_batch * num_batches;
 
-            // Generate test data
-            let generator = TwoColumnBatchGenerator::new(
-                rows_per_batch,
-                num_batches,
-                num_groups,
-                config.bytes_length,
-            );
-            let schema = generator.schema();
-            let batches = generator.generate_batches();
+                let label = format!("{}/{}/dvg_{}", config.name, binary_type_label, distinct_values_per_group);
 
-            // Serialize batches to IPC format for full pipeline benchmark
-            let ipc_data = serialize_to_ipc(&batches, &schema);
-            let ipc_size = ipc_data.len();
-
-            // Calculate approximate data size for throughput metric
-            let data_size: usize = batches
-                .iter()
-                .map(|b| b.get_array_memory_size())
-                .sum();
-
-            // Log configuration for visibility in benchmark output
-            println!(
-                "Config: {} rows, {}, distinct_keys={}, data size={:.2} MB, IPC size={:.2} MB",
-                total_rows,
-                config.name,
-                num_groups,
-                data_size as f64 / (1024.0 * 1024.0),
-                ipc_size as f64 / (1024.0 * 1024.0)
-            );
-
-            // Set throughput metric for bytes/second calculations
-            group.throughput(Throughput::Bytes(ipc_size as u64));
-
-            // Validation (NOT timed - run once before benchmarking)
-            // Verify the number of groups matches expected distinct_keys
-            {
-                let validation_batches = batches.clone();
-                let validation_result = rt.block_on(async {
-                    let source = Arc::new(BatchSourceExec::new(
-                        Arc::clone(&schema),
-                        validation_batches,
-                    )) as Arc<dyn ExecutionPlan>;
-                    let plan = create_distinct_count_groupby_plan(source);
-                    let task_ctx = Arc::new(TaskContext::default());
-                    collect(plan, task_ctx).await.unwrap()
-                });
-                let total_result_rows: usize = validation_result.iter()
-                    .map(|batch| batch.num_rows())
-                    .sum();
-                assert_eq!(
-                    total_result_rows,
+                // Load test data from Arrow file
+                let arrow_file_path = get_arrow_file_path(
+                    arrow_folder.to_str().unwrap(),
+                    config.name, // Use config.name for the file name
                     num_groups,
-                    "Expected {} distinct groups, got {}",
-                    num_groups,
-                    total_result_rows
+                    distinct_values_per_group,
                 );
-            }
+                println!("Reading Arrow file: {}", arrow_file_path.display());
+                let (schema, batches) = load_batches_from_arrow_file(&arrow_file_path, binary_type);
 
-            // Benchmark 1: Aggregation execution only
-            // Uses pre-generated batches directly, isolating AggregateExec performance
-            group.bench_with_input(
-                BenchmarkId::new("agg_only", &label),
-                &batches,
-                |b, batches| {
-                    b.iter_batched(
-                        // Setup: clone batches (NOT timed) - needed because execution consumes them
-                        || batches.clone(),
-                        // Benchmark: execute aggregation (TIMED)
-                        |batches| {
+                // Calculate approximate data size for throughput metric
+                let data_size: usize = batches
+                    .iter()
+                    .map(|b| b.get_array_memory_size())
+                    .sum();
+
+                // Log configuration for visibility in benchmark output
+                println!(
+                    "Config: {} rows, {}, {}, dvg={}, data size={:.2} MB, Arrow file: {}",
+                    total_rows,
+                    config.name,
+                    binary_type_label,
+                    distinct_values_per_group,
+                    data_size as f64 / (1024.0 * 1024.0),
+                    arrow_file_path.display()
+                );
+
+                // Set throughput metric for bytes/second calculations
+                group.throughput(Throughput::Bytes(data_size as u64));
+
+                // Validation (NOT timed - run once before benchmarking)
+                {
+                    let validation_batches = batches.clone();
+                    let validation_result = rt.block_on(async {
+                        let source = Arc::new(BatchSourceExec::new(
+                            Arc::clone(&schema),
+                            validation_batches,
+                        )) as Arc<dyn ExecutionPlan>;
+                        let plan = create_distinct_count_groupby_plan(source);
+                        let task_ctx = Arc::new(TaskContext::default());
+                        collect(plan, task_ctx).await.unwrap()
+                    });
+                    let total_result_rows: usize = validation_result.iter()
+                        .map(|batch| batch.num_rows())
+                        .sum();
+                    assert_eq!(
+                        total_result_rows,
+                        num_groups,
+                        "Expected {} distinct groups, got {}",
+                        num_groups,
+                        total_result_rows
+                    );
+                }
+
+                // Benchmark 2: Full pipeline (deser + aggregation + output serialization)
+                // Measures complete round-trip: IPC in -> aggregate -> IPC out
+                // Relevant for scenarios where results are sent over network or stored
+                group.bench_with_input(
+                    BenchmarkId::new("full_pipeline", &label),
+                    &batches,
+                    |b, batches| {
+                        b.iter(|| {
                             rt.block_on(async {
                                 let source = Arc::new(BatchSourceExec::new(
                                     Arc::clone(&schema),
-                                    batches,
+                                    batches.clone(),
                                 )) as Arc<dyn ExecutionPlan>;
                                 let plan = create_distinct_count_groupby_plan(source);
                                 let task_ctx = Arc::new(TaskContext::default());
                                 let results = collect(plan, task_ctx).await.unwrap();
-                                black_box(results)
+                                // Serialize results back to IPC format
+                                let output_ipc = serialize_results_to_ipc(&results);
+                                black_box(output_ipc)
                             })
-                        },
-                        BatchSize::SmallInput,
-                    )
-                },
-            );
-
-            let data_buffer = Buffer::from_vec(ipc_data);
-
-            // Benchmark 2: Full pipeline (deser + aggregation + output serialization)
-            // Measures complete round-trip: IPC in -> aggregate -> IPC out
-            // Relevant for scenarios where results are sent over network or stored
-            group.bench_with_input(
-                BenchmarkId::new("full_pipeline", &label),
-                &data_buffer,
-                |b, data_buffer| {
-                    b.iter(|| {
-                        rt.block_on(async {
-                            let (schema, batches) = deserialize_zero_copy(data_buffer);
-                            let source = Arc::new(BatchSourceExec::new(
-                                Arc::clone(&schema),
-                                batches,
-                            )) as Arc<dyn ExecutionPlan>;
-                            let plan = create_distinct_count_groupby_plan(source);
-                            let task_ctx = Arc::new(TaskContext::default());
-                            let results = collect(plan, task_ctx).await.unwrap();
-                            // Serialize results back to IPC format
-                            let output_ipc = serialize_results_to_ipc(&results);
-                            black_box(output_ipc)
                         })
-                    })
-                },
-            );
+                    },
+                );
+            }
         }
     }
-
     group.finish();
 }
 
