@@ -78,6 +78,7 @@ criterion = { workspace = true, features = ["async_futures"] }
 datafusion-functions-aggregate = { workspace = true }
 datafusion-functions-window = { workspace = true }
 insta = { workspace = true }
+jni = { version = "0.21.1", features = ["invocation"] }
 rand = { workspace = true }
 rstest = { workspace = true }
 rstest_reuse = "0.7.0"
@@ -130,5 +131,12 @@ name = "hash_join_bench"
 
 [[bench]]
 harness = false
+name = "hash_join_by_type"
+
+[[bench]]
+harness = false
 name = "distinct_group_by_bench"
 
+[[bench]]
+harness = false
+name = "filter_jni_benchmark"

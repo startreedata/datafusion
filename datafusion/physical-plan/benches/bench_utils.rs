@@ -24,11 +24,11 @@ use std::io::Write;
 use std::sync::Arc;
 
 use arrow::array::{
-    ArrayRef, BinaryArray, Float32Array, Float64Array, Int32Array, Int64Array,
-    RecordBatch, StringArray,
+    ArrayRef, BinaryArray, DictionaryArray, Float32Array, Float64Array, Int16Array,
+    Int32Array, Int64Array, RecordBatch, StringArray, StringViewArray,
 };
 use arrow::buffer::Buffer;
-use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+use arrow::datatypes::{DataType, Field, Int16Type, Schema, SchemaRef};
 use arrow::ipc::convert::fb_to_schema;
 use arrow::ipc::reader::{FileDecoder, read_footer_length};
 use arrow::ipc::writer::FileWriter;
@@ -48,21 +48,50 @@ use rand::{Rng, SeedableRng};
 // Schema Definition
 // ============================================================================
 
+/// String column type for benchmarks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StringColumnType {
+    /// Regular Utf8 strings
+    Utf8,
+    /// Utf8View strings (optimized for strings ≤12 bytes)
+    Utf8View,
+    /// Dictionary-encoded Utf8 strings with Int16 keys
+    DictionaryUtf8,
+    /// Dictionary-encoded Utf8View strings with Int16 keys
+    DictionaryUtf8View,
+}
+
 /// Creates the benchmark schema with the following columns:
-/// - colInt: Int32 - integer values with modulo pattern
-/// - colLong: Int64 - long values with modulo pattern  
-/// - colFloat: Float32 - floating point values
-/// - colDouble: Float64 - double precision values
-/// - colString: Utf8 - string values with limited cardinality
-/// - colBinary: Binary - random binary data of configurable size
+/// - colint: Int32 - integer values with modulo pattern
+/// - collong: Int64 - long values with modulo pattern
+/// - colfloat: Float32 - floating point values
+/// - coldouble: Float64 - double precision values
+/// - colstring: Utf8 - string values with limited cardinality
+/// - colbinary: Binary - random binary data of configurable size
 pub fn create_schema() -> SchemaRef {
+    create_schema_with_string_type(StringColumnType::Utf8)
+}
+
+/// Creates the benchmark schema with a specific string column type.
+pub fn create_schema_with_string_type(string_type: StringColumnType) -> SchemaRef {
+    let string_data_type = match string_type {
+        StringColumnType::Utf8 => DataType::Utf8,
+        StringColumnType::Utf8View => DataType::Utf8View,
+        StringColumnType::DictionaryUtf8 => {
+            DataType::Dictionary(Box::new(DataType::Int16), Box::new(DataType::Utf8))
+        }
+        StringColumnType::DictionaryUtf8View => {
+            DataType::Dictionary(Box::new(DataType::Int16), Box::new(DataType::Utf8View))
+        }
+    };
+
     Arc::new(Schema::new(vec![
-        Field::new("colInt", DataType::Int32, false),
-        Field::new("colLong", DataType::Int64, false),
-        Field::new("colFloat", DataType::Float32, false),
-        Field::new("colDouble", DataType::Float64, false),
-        Field::new("colString", DataType::Utf8, false),
-        Field::new("colBinary", DataType::Binary, false),
+        Field::new("colint", DataType::Int32, false),
+        Field::new("collong", DataType::Int64, false),
+        Field::new("colfloat", DataType::Float32, false),
+        Field::new("coldouble", DataType::Float64, false),
+        Field::new("colstring", string_data_type, false),
+        Field::new("colbinary", DataType::Binary, false),
     ]))
 }
 
@@ -101,6 +130,42 @@ pub fn create_join_build_schema() -> SchemaRef {
     )]))
 }
 
+/// Creates a single-column schema with a Utf8 column named "colString".
+pub fn create_join_build_schema_string() -> SchemaRef {
+    Arc::new(Schema::new(vec![Field::new(
+        "colString",
+        DataType::Utf8,
+        false,
+    )]))
+}
+
+/// Creates a single-column schema with a Utf8View column named "colString".
+pub fn create_join_build_schema_string_view() -> SchemaRef {
+    Arc::new(Schema::new(vec![Field::new(
+        "colString",
+        DataType::Utf8View,
+        false,
+    )]))
+}
+
+/// Creates a single-column schema with a Dictionary(Int16, Utf8) column named "colString".
+pub fn create_join_build_schema_dictionary_string() -> SchemaRef {
+    Arc::new(Schema::new(vec![Field::new(
+        "colString",
+        DataType::Dictionary(Box::new(DataType::Int16), Box::new(DataType::Utf8)),
+        false,
+    )]))
+}
+
+/// Creates a single-column schema with a Dictionary(Int16, Utf8View) column named "colString".
+pub fn create_join_build_schema_dictionary_string_view() -> SchemaRef {
+    Arc::new(Schema::new(vec![Field::new(
+        "colString",
+        DataType::Dictionary(Box::new(DataType::Int16), Box::new(DataType::Utf8View)),
+        false,
+    )]))
+}
+
 // ============================================================================
 // Data Generation
 // ============================================================================
@@ -115,7 +180,7 @@ pub fn create_join_build_schema() -> SchemaRef {
 /// - `colLong`: `i % 5000` - same pattern as colInt
 /// - `colFloat`: `i / 2.0` - monotonically increasing
 /// - `colDouble`: `i / 3.0` - monotonically increasing
-/// - `colString`: `"str_" + (i % 100)` - 100 distinct string values
+/// - `colString`: `format!("str_{:04}", (start_row + i) % 5000)` - 100 distinct string values
 /// - `colBinary`: random bytes of configurable size (seeded for reproducibility)
 pub struct FunctionalBatchGenerator {
     /// Schema for generated batches
@@ -126,6 +191,8 @@ pub struct FunctionalBatchGenerator {
     num_batches: usize,
     /// Size in bytes for the binary column
     binary_size: usize,
+    /// Type of string column to generate
+    string_column_type: StringColumnType,
     /// Random number generator for binary data (seeded for reproducibility)
     rng: StdRng,
 }
@@ -144,6 +211,24 @@ impl FunctionalBatchGenerator {
         num_batches: usize,
         binary_size: usize,
     ) -> Self {
+        Self::new_with_string_type(schema, rows_per_batch, num_batches, binary_size, StringColumnType::Utf8)
+    }
+
+    /// Creates a new batch generator with a specific string column type.
+    ///
+    /// # Arguments
+    /// * `schema` - Arrow schema for the generated batches
+    /// * `rows_per_batch` - Number of rows per batch
+    /// * `num_batches` - Total number of batches to generate
+    /// * `binary_size` - Size in bytes for the binary column values
+    /// * `string_column_type` - Type of string column to generate
+    pub fn new_with_string_type(
+        schema: SchemaRef,
+        rows_per_batch: usize,
+        num_batches: usize,
+        binary_size: usize,
+        string_column_type: StringColumnType,
+    ) -> Self {
         // Use a fixed seed for reproducible benchmarks
         let rng = StdRng::seed_from_u64(42);
         Self {
@@ -151,6 +236,7 @@ impl FunctionalBatchGenerator {
             rows_per_batch,
             num_batches,
             binary_size,
+            string_column_type,
             rng,
         }
     }
@@ -182,50 +268,85 @@ impl FunctionalBatchGenerator {
     /// Generates a single column array based on field name.
     ///
     /// Values are deterministic functions of the global row index `i`:
-    /// - colInt: `i % 5000` (5000 distinct values)
-    /// - colLong: `i % 5000` (5000 distinct values)
-    /// - colFloat: `i / 2.0` (monotonically increasing)
-    /// - colDouble: `i / 3.0` (monotonically increasing)
-    /// - colString: `"str_{i % 100}"` (100 distinct values)
-    /// - colBinary: random bytes of `binary_size` length
+    /// - colint: `i % 5000` (5000 distinct values)
+    /// - collong: `i % 5000` (5000 distinct values)
+    /// - colfloat: `i / 2.0` (monotonically increasing)
+    /// - coldouble: `i / 3.0` (monotonically increasing)
+    /// - colstring: format!("str_{:04}", (start_row + i) % 5000) (5000 distinct strings)
+    /// - colbinary: random bytes of `binary_size` length
     fn generate_column(&mut self, field_name: &str, start_row: usize, num_rows: usize) -> ArrayRef {
         match field_name {
-            "colInt" => {
+            "colint" => {
                 // Integer values with modulo 5000 pattern for reasonable cardinality
                 let values: Vec<i32> = (0..num_rows)
                     .map(|i| ((start_row + i) % 5000) as i32)
                     .collect();
                 Arc::new(Int32Array::from(values))
             }
-            "colLong" => {
-                // Long values with same modulo pattern as colInt
+            "collong" => {
+                // Long values with same modulo pattern as colint
                 let values: Vec<i64> = (0..num_rows)
                     .map(|i| ((start_row + i) % 5000) as i64)
                     .collect();
                 Arc::new(Int64Array::from(values))
             }
-            "colFloat" => {
+            "colfloat" => {
                 // Monotonically increasing float values
                 let values: Vec<f32> = (0..num_rows)
                     .map(|i| ((start_row + i) as f32) / 2.0)
                     .collect();
                 Arc::new(Float32Array::from(values))
             }
-            "colDouble" => {
+            "coldouble" => {
                 // Monotonically increasing double values
                 let values: Vec<f64> = (0..num_rows)
                     .map(|i| ((start_row + i) as f64) / 3.0)
                     .collect();
                 Arc::new(Float64Array::from(values))
             }
-            "colString" => {
-                // String values with 100 distinct values (low cardinality)
-                let values: Vec<String> = (0..num_rows)
-                    .map(|i| format!("str_{}", (start_row + i) % 100))
+            "colstring" => {
+                // String values with 5000 distinct values (9 bytes each: "str_0000" to "str_4999")
+                let string_values: Vec<String> = (0..num_rows)
+                    .map(|i| format!("str_{:04}", (start_row + i) % 5000))
                     .collect();
-                Arc::new(StringArray::from(values))
+
+                match self.string_column_type {
+                    StringColumnType::Utf8 => {
+                        Arc::new(StringArray::from(string_values))
+                    }
+                    StringColumnType::Utf8View => {
+                        Arc::new(StringViewArray::from(string_values))
+                    }
+                    StringColumnType::DictionaryUtf8 => {
+                        // Create dictionary from unique values, then create keys array
+                        let keys: Int16Array = (0..num_rows)
+                            .map(|i| ((start_row + i) % 5000) as i16)
+                            .collect();
+
+                        // Build dictionary values (unique strings)
+                        let dict_values_vec: Vec<String> = (0..5000)
+                            .map(|i| format!("str_{:04}", i))
+                            .collect();
+                        let dict_values = StringArray::from(dict_values_vec);
+
+                        Arc::new(DictionaryArray::<Int16Type>::try_new(keys, Arc::new(dict_values)).unwrap())
+                    }
+                    StringColumnType::DictionaryUtf8View => {
+                        let keys: Int16Array = (0..num_rows)
+                            .map(|i| ((start_row + i) % 5000) as i16)
+                            .collect();
+
+                        // Build dictionary values (unique strings as StringView)
+                        let dict_values_vec: Vec<String> = (0..5000)
+                            .map(|i| format!("str_{:04}", i))
+                            .collect();
+                        let dict_values = StringViewArray::from(dict_values_vec);
+
+                        Arc::new(DictionaryArray::<Int16Type>::try_new(keys, Arc::new(dict_values)).unwrap())
+                    }
+                }
             }
-            "colBinary" => {
+            "colbinary" => {
                 // Random binary data of configurable size
                 let values: Vec<Vec<u8>> = (0..num_rows)
                     .map(|_| {
@@ -395,6 +516,21 @@ impl SingleColumnBatchGenerator {
 // Join Build Side Data Generation
 // ============================================================================
 
+/// Type of join column to generate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JoinColumnType {
+    /// Int32 column
+    Int,
+    /// Utf8 string column
+    String,
+    /// Utf8View string column
+    StringView,
+    /// Dictionary(Int16, Utf8) column
+    DictionaryString,
+    /// Dictionary(Int16, Utf8View) column
+    DictionaryStringView,
+}
+
 /// Generates single-column record batches for the build side of join benchmarks.
 ///
 /// This generator creates data with controlled match rates and key repetition patterns,
@@ -407,12 +543,14 @@ impl SingleColumnBatchGenerator {
 /// - Total rows = `(match_rate * 5000) * repeated_keys`
 /// - Sequential/deterministic: 0, 0, ..., 0, 1, 1, ..., 1, etc.
 pub struct JoinBuildSideGenerator {
-    /// Schema for generated batches (single colInt column)
+    /// Schema for generated batches
     schema: SchemaRef,
     /// Match rate (0.5 or 1.0) - determines the range of keys
     match_rate: f64,
     /// Number of times each key is repeated
     repeated_keys: usize,
+    /// Type of column to generate
+    column_type: JoinColumnType,
 }
 
 impl JoinBuildSideGenerator {
@@ -425,11 +563,35 @@ impl JoinBuildSideGenerator {
     /// # Returns
     /// A new generator configured for the specified match rate and repetition.
     pub fn new(match_rate: f64, repeated_keys: usize) -> Self {
-        let schema = create_join_build_schema();
+        Self::new_with_column_type(match_rate, repeated_keys, JoinColumnType::Int)
+    }
+
+    /// Creates a new join build side generator with a specific column type.
+    ///
+    /// # Arguments
+    /// * `match_rate` - Fraction of probe-side keys that will match (0.5 or 1.0)
+    /// * `repeated_keys` - Number of times each distinct key appears
+    /// * `column_type` - Type of column to generate
+    ///
+    /// # Returns
+    /// A new generator configured for the specified match rate, repetition, and column type.
+    pub fn new_with_column_type(
+        match_rate: f64,
+        repeated_keys: usize,
+        column_type: JoinColumnType,
+    ) -> Self {
+        let schema = match column_type {
+            JoinColumnType::Int => create_join_build_schema(),
+            JoinColumnType::String => create_join_build_schema_string(),
+            JoinColumnType::StringView => create_join_build_schema_string_view(),
+            JoinColumnType::DictionaryString => create_join_build_schema_dictionary_string(),
+            JoinColumnType::DictionaryStringView => create_join_build_schema_dictionary_string_view(),
+        };
         Self {
             schema,
             match_rate,
             repeated_keys,
+            column_type,
         }
     }
 
@@ -454,19 +616,69 @@ impl JoinBuildSideGenerator {
     /// `(match_rate * 5000) - 1` appears `repeated_keys` times consecutively.
     ///
     /// Example with match_rate=0.5 (2500 keys) and repeated_keys=2:
-    /// `[0, 0, 1, 1, 2, 2, ..., 2499, 2499]`
+    /// - Int: `[0, 0, 1, 1, 2, 2, ..., 2499, 2499]`
+    /// - String: `["str_0000", "str_0000", "str_0001", "str_0001", ..., "str_2499", "str_2499"]`
     pub fn generate_batches(&self) -> Vec<RecordBatch> {
         let distinct_keys = self.distinct_keys();
         let total_rows = self.total_rows();
 
-        // Generate values: each key from 0 to distinct_keys-1 repeated repeated_keys times
-        let values: Vec<i32> = (0..distinct_keys)
-            .flat_map(|key| std::iter::repeat(key as i32).take(self.repeated_keys))
-            .collect();
+        let column: ArrayRef = match self.column_type {
+            JoinColumnType::Int => {
+                // Generate integer values: each key from 0 to distinct_keys-1 repeated repeated_keys times
+                let values: Vec<i32> = (0..distinct_keys)
+                    .flat_map(|key| std::iter::repeat(key as i32).take(self.repeated_keys))
+                    .collect();
+                assert_eq!(values.len(), total_rows);
+                Arc::new(Int32Array::from(values))
+            }
+            JoinColumnType::String => {
+                // Generate string values: each key as "str_{key:04}" repeated repeated_keys times
+                let values: Vec<String> = (0..distinct_keys)
+                    .flat_map(|key| std::iter::repeat(format!("str_{:04}", key)).take(self.repeated_keys))
+                    .collect();
+                assert_eq!(values.len(), total_rows);
+                Arc::new(StringArray::from(values))
+            }
+            JoinColumnType::StringView => {
+                // Generate string view values
+                let values: Vec<String> = (0..distinct_keys)
+                    .flat_map(|key| std::iter::repeat(format!("str_{:04}", key)).take(self.repeated_keys))
+                    .collect();
+                assert_eq!(values.len(), total_rows);
+                Arc::new(StringViewArray::from(values))
+            }
+            JoinColumnType::DictionaryString => {
+                // Generate dictionary-encoded string values
+                // Dictionary contains distinct_keys unique strings
+                // Keys array contains indices that repeat according to repeated_keys
+                let dict_values_vec: Vec<String> = (0..distinct_keys)
+                    .map(|key| format!("str_{:04}", key))
+                    .collect();
+                let dict_values = StringArray::from(dict_values_vec);
 
-        assert_eq!(values.len(), total_rows);
+                let keys: Int16Array = (0..distinct_keys)
+                    .flat_map(|key| std::iter::repeat(key as i16).take(self.repeated_keys))
+                    .collect();
 
-        let column: ArrayRef = Arc::new(Int32Array::from(values));
+                assert_eq!(keys.len(), total_rows);
+                Arc::new(DictionaryArray::<Int16Type>::try_new(keys, Arc::new(dict_values)).unwrap())
+            }
+            JoinColumnType::DictionaryStringView => {
+                // Generate dictionary-encoded string view values
+                let dict_values_vec: Vec<String> = (0..distinct_keys)
+                    .map(|key| format!("str_{:04}", key))
+                    .collect();
+                let dict_values = StringViewArray::from(dict_values_vec);
+
+                let keys: Int16Array = (0..distinct_keys)
+                    .flat_map(|key| std::iter::repeat(key as i16).take(self.repeated_keys))
+                    .collect();
+
+                assert_eq!(keys.len(), total_rows);
+                Arc::new(DictionaryArray::<Int16Type>::try_new(keys, Arc::new(dict_values)).unwrap())
+            }
+        };
+
         let batch = RecordBatch::try_new(Arc::clone(&self.schema), vec![column])
             .expect("Failed to create record batch");
 
