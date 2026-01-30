@@ -86,51 +86,52 @@ fn bench_deserialize(c: &mut Criterion) {
 
     // Configuration: 1M rows total (10K rows × 100 batches)
     let rows_per_batch = 10_000;
-    let num_batches = 100;
-    let total_rows = rows_per_batch * num_batches;
+    let num_batches_vec = vec![1, 100];
 
     // Test different binary column sizes to understand deserialization overhead
-    let binary_sizes = vec![10, 1024, 2048];
+    for num_batches in num_batches_vec {
+        let total_rows = rows_per_batch * num_batches;
+        let binary_sizes = vec![10, 1024, 2048];
+        for binary_size in binary_sizes {
+            let label = format!("{num_batches}_batches/rows_binary_{binary_size}B");
 
-    for binary_size in binary_sizes {
-        let label = format!("1M_rows_binary_{binary_size}B");
+            // Generate test data and serialize to IPC format
+            let schema = create_schema();
+            let mut generator = FunctionalBatchGenerator::new(
+                Arc::clone(&schema),
+                rows_per_batch,
+                num_batches,
+                binary_size,
+            );
+            let batches = generator.generate_batches();
+            let ipc_data = serialize_to_ipc(&batches, &schema);
 
-        // Generate test data and serialize to IPC format
-        let schema = create_schema();
-        let mut generator = FunctionalBatchGenerator::new(
-            Arc::clone(&schema),
-            rows_per_batch,
-            num_batches,
-            binary_size,
-        );
-        let batches = generator.generate_batches();
-        let ipc_data = serialize_to_ipc(&batches, &schema);
+            // Convert to Buffer for zero-copy deserialization
+            let buffer = Buffer::from_vec(ipc_data);
 
-        // Convert to Buffer for zero-copy deserialization
-        let buffer = Buffer::from_vec(ipc_data);
+            // Set throughput metric for bytes/second calculations
+            group.throughput(Throughput::Bytes(buffer.len() as u64));
 
-        // Set throughput metric for bytes/second calculations
-        group.throughput(Throughput::Bytes(buffer.len() as u64));
+            // Log configuration
+            println!(
+                "Config (zero-copy): {} rows, binary_size={} bytes, IPC size={:.2} MB",
+                total_rows,
+                binary_size,
+                buffer.len() as f64 / (1024.0 * 1024.0)
+            );
 
-        // Log configuration
-        println!(
-            "Config (zero-copy): {} rows, binary_size={} bytes, IPC size={:.2} MB",
-            total_rows,
-            binary_size,
-            buffer.len() as f64 / (1024.0 * 1024.0)
-        );
-
-        group.bench_with_input(
-            BenchmarkId::from_parameter(&label),
-            &buffer,
-            |b, buffer| {
-                b.iter(|| {
-                    let (schema, batches) = deserialize_zero_copy(buffer);
-                    // black_box prevents compiler from optimizing away unused results
-                    black_box((schema, batches))
-                })
-            },
-        );
+            group.bench_with_input(
+                BenchmarkId::from_parameter(&label),
+                &buffer,
+                |b, buffer| {
+                    b.iter(|| {
+                        let (schema, batches) = deserialize_zero_copy(buffer);
+                        // black_box prevents compiler from optimizing away unused results
+                        black_box((schema, batches))
+                    })
+                },
+            );
+        }
     }
 
     group.finish();

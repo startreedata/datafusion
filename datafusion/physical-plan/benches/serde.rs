@@ -84,50 +84,52 @@ fn bench_serialize(c: &mut Criterion) {
 
     // Configuration: 1M rows total (10K rows × 100 batches)
     let rows_per_batch = 10_000;
-    let num_batches = 100;
-    let total_rows = rows_per_batch * num_batches;
+    let num_batches_vec = vec![1, 100];
+    for num_batches in num_batches_vec {
+        let total_rows = rows_per_batch * num_batches;
 
-    // Test different binary column sizes to understand serialization overhead
-    let binary_sizes = vec![10, 1024, 2048];
+        // Test different binary column sizes to understand serialization overhead
+        let binary_sizes = vec![10, 1024, 2048];
 
-    for binary_size in binary_sizes {
-        let label = format!("1M_rows_binary_{binary_size}B");
+        for binary_size in binary_sizes {
+            let label = format!("{num_batches}_batches/rows_binary_{binary_size}B");
 
-        // Generate test data
-        let schema = create_schema();
-        let mut generator = FunctionalBatchGenerator::new(
-            Arc::clone(&schema),
-            rows_per_batch,
-            num_batches,
-            binary_size,
-        );
-        let batches = generator.generate_batches();
+            // Generate test data
+            let schema = create_schema();
+            let mut generator = FunctionalBatchGenerator::new(
+                Arc::clone(&schema),
+                rows_per_batch,
+                num_batches,
+                binary_size,
+            );
+            let batches = generator.generate_batches();
 
-        // Calculate expected output size for throughput metric
-        let expected_size = estimate_serialized_size(&batches, binary_size, total_rows);
+            // Calculate expected output size for throughput metric
+            let expected_size = estimate_serialized_size(&batches, binary_size, total_rows);
 
-        // Set throughput metric for bytes/second calculations
-        group.throughput(Throughput::Bytes(expected_size as u64));
+            // Set throughput metric for bytes/second calculations
+            group.throughput(Throughput::Bytes(expected_size as u64));
 
-        // Log configuration
-        println!(
-            "Config (sink): {} rows, binary_size={} bytes, estimated output={:.2} MB",
-            total_rows,
-            binary_size,
-            expected_size as f64 / (1024.0 * 1024.0)
-        );
+            // Log configuration
+            println!(
+                "Config (sink): {} rows, binary_size={} bytes, estimated output={:.2} MB",
+                total_rows,
+                binary_size,
+                expected_size as f64 / (1024.0 * 1024.0)
+            );
 
-        group.bench_with_input(
-            BenchmarkId::from_parameter(&label),
-            &batches,
-            |b, batches| {
-                b.iter(|| {
-                    let bytes_written = serialize_batches_to_sink(batches, &schema);
-                    // black_box prevents compiler from optimizing away unused results
-                    black_box(bytes_written)
-                })
-            },
-        );
+            group.bench_with_input(
+                BenchmarkId::from_parameter(&label),
+                &batches,
+                |b, batches| {
+                    b.iter(|| {
+                        let bytes_written = serialize_batches_to_sink(batches, &schema);
+                        // black_box prevents compiler from optimizing away unused results
+                        black_box(bytes_written)
+                    })
+                },
+            );
+        }
     }
 
     group.finish();
