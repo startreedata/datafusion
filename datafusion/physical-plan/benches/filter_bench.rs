@@ -120,7 +120,7 @@ fn create_filter_plan(
     schema: &SchemaRef,
 ) -> Arc<dyn ExecutionPlan> {
     // Build the predicate: colInt > 2500
-    let col_int = Arc::new(Column::new_with_schema("colInt", schema).unwrap())
+    let col_int = Arc::new(Column::new_with_schema("colint", schema).unwrap())
         as Arc<dyn PhysicalExpr>;
     let threshold =
         Arc::new(Literal::new(ScalarValue::Int32(Some(2500)))) as Arc<dyn PhysicalExpr>;

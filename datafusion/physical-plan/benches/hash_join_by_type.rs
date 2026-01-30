@@ -175,11 +175,11 @@ impl BenchConfig {
 
     fn join_column_name(&self) -> &'static str {
         match self.join_column_type {
-            JoinColumnType::Int => "colInt",
+            JoinColumnType::Int => "colint",
             JoinColumnType::String
             | JoinColumnType::StringView
             | JoinColumnType::DictionaryString
-            | JoinColumnType::DictionaryStringView => "colString",
+            | JoinColumnType::DictionaryStringView => "colstring",
         }
     }
 
@@ -386,8 +386,8 @@ mod tests {
         };
 
         let join_column_name = match column_type {
-            JoinColumnType::Int => "colInt",
-            _ => "colString",
+            JoinColumnType::Int => "colint",
+            _ => "colstring",
         };
 
         // Generate probe side data

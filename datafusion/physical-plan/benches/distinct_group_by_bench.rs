@@ -93,8 +93,8 @@ fn create_distinct_count_groupby_plan(input: Arc<dyn ExecutionPlan>) -> Arc<dyn 
 
     // Build GROUP BY expression: GROUP BY colInt
     let group_col =
-        Arc::new(Column::new_with_schema("colInt", &schema).unwrap()) as Arc<dyn PhysicalExpr>;
-    let group_expr = vec![(Arc::clone(&group_col), "colInt".to_string())];
+        Arc::new(Column::new_with_schema("colint", &schema).unwrap()) as Arc<dyn PhysicalExpr>;
+    let group_expr = vec![(Arc::clone(&group_col), "colint".to_string())];
     let group_by = PhysicalGroupBy::new_single(group_expr);
 
     // Build aggregate expression: COUNT(DISTINCT bytes)

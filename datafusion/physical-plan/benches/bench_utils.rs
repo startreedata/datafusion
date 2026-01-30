@@ -124,7 +124,7 @@ pub fn create_binary_column_schema() -> SchemaRef {
 /// Used for join benchmarks where the build side has only the join key column.
 pub fn create_join_build_schema() -> SchemaRef {
     Arc::new(Schema::new(vec![Field::new(
-        "colInt",
+        "colint",
         DataType::Int32,
         false,
     )]))
@@ -133,7 +133,7 @@ pub fn create_join_build_schema() -> SchemaRef {
 /// Creates a single-column schema with a Utf8 column named "colString".
 pub fn create_join_build_schema_string() -> SchemaRef {
     Arc::new(Schema::new(vec![Field::new(
-        "colString",
+        "colstring",
         DataType::Utf8,
         false,
     )]))
@@ -142,7 +142,7 @@ pub fn create_join_build_schema_string() -> SchemaRef {
 /// Creates a single-column schema with a Utf8View column named "colString".
 pub fn create_join_build_schema_string_view() -> SchemaRef {
     Arc::new(Schema::new(vec![Field::new(
-        "colString",
+        "colstring",
         DataType::Utf8View,
         false,
     )]))
@@ -151,7 +151,7 @@ pub fn create_join_build_schema_string_view() -> SchemaRef {
 /// Creates a single-column schema with a Dictionary(Int16, Utf8) column named "colString".
 pub fn create_join_build_schema_dictionary_string() -> SchemaRef {
     Arc::new(Schema::new(vec![Field::new(
-        "colString",
+        "colstring",
         DataType::Dictionary(Box::new(DataType::Int16), Box::new(DataType::Utf8)),
         false,
     )]))
@@ -160,7 +160,7 @@ pub fn create_join_build_schema_dictionary_string() -> SchemaRef {
 /// Creates a single-column schema with a Dictionary(Int16, Utf8View) column named "colString".
 pub fn create_join_build_schema_dictionary_string_view() -> SchemaRef {
     Arc::new(Schema::new(vec![Field::new(
-        "colString",
+        "colstring",
         DataType::Dictionary(Box::new(DataType::Int16), Box::new(DataType::Utf8View)),
         false,
     )]))
