@@ -7,8 +7,12 @@ import org.apache.arrow.c.CDataDictionaryProvider;
 import org.apache.arrow.c.Data;
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.memory.RootAllocator;
+import org.apache.arrow.vector.BitVector;
 import org.apache.arrow.vector.IntVector;
 import org.apache.arrow.vector.VectorSchemaRoot;
+import org.apache.arrow.vector.types.pojo.ArrowType;
+import org.apache.arrow.vector.types.pojo.Field;
+import org.apache.arrow.vector.types.pojo.FieldType;
 import org.apache.arrow.vector.types.pojo.Schema;
 
 
@@ -26,6 +30,9 @@ public class Udf {
 
   /**
    * Evaluates the predicate: value > 2500
+   *
+   * Returns a boolean array indicating which rows pass the filter. For each filter,
+   * there is a corresponding boolean value: true if the row passes, false otherwise.
    *
    * @param schemaPtr Pointer to FFI_ArrowSchema (C Data Interface)
    * @param arrayPtr Pointer to FFI_ArrowArray (C Data Interface)
@@ -52,32 +59,26 @@ public class Udf {
 
       int rowCount = root.getRowCount();
 
-      // Create boolean result vector
-      org.apache.arrow.vector.BitVector resultVector = new org.apache.arrow.vector.BitVector("result", allocator);
+      // Create result schema root with single boolean column
+      Field field = new Field("result", FieldType.nullable(new ArrowType.Bool()), null);
+      Schema resultSchema = new Schema(java.util.Collections.singletonList(field));
+
+      VectorSchemaRoot resultRoot = VectorSchemaRoot.create(resultSchema, allocator);
+      resultRoot.setRowCount(rowCount);
+
+      // Get the BitVector from the result root
+      BitVector resultVector = (BitVector) resultRoot.getVector(0);
       resultVector.allocateNew(rowCount);
 
       // Evaluate predicate for each row
       for (int i = 0; i < rowCount; i++) {
         boolean passes = !intVector.isNull(i) && intVector.get(i) > 2500;
-        resultVector.set(i, passes ? 1 : 0);
+        if (passes) {
+          resultVector.set(i, 1);
+        }
+        // Note: BitVector bits are initialized to 0 by allocateNew(), so no need to explicitly set false values
       }
       resultVector.setValueCount(rowCount);
-
-      // Create result schema root with single boolean column
-      org.apache.arrow.vector.types.pojo.Field field = 
-          new org.apache.arrow.vector.types.pojo.Field("result", 
-              org.apache.arrow.vector.types.pojo.FieldType.nullable(
-                  new org.apache.arrow.vector.types.pojo.ArrowType.Bool()), 
-              null);
-      org.apache.arrow.vector.types.pojo.Schema resultSchema = 
-          new org.apache.arrow.vector.types.pojo.Schema(java.util.Collections.singletonList(field));
-      
-      VectorSchemaRoot resultRoot = VectorSchemaRoot.create(resultSchema, allocator);
-      resultRoot.setRowCount(rowCount);
-      
-      // Transfer the result vector to the result root
-      resultRoot.getFieldVectors().get(0).close();
-      resultRoot.getFieldVectors().set(0, resultVector);
 
       // Export result to FFI pointers
       ArrowArray resultArray = ArrowArray.allocateNew(allocator);

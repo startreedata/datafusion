@@ -91,7 +91,7 @@ use std::any::Any;
 use std::hint::black_box;
 use std::sync::Arc;
 
-use arrow::array::{Array, BooleanArray, Int32Array, StructArray, make_array};
+use arrow::array::{Array, BooleanArray, Int32Array, StructArray};
 use arrow::buffer::Buffer;
 use arrow::datatypes::DataType;
 use arrow::ffi::{from_ffi, to_ffi, FFI_ArrowArray, FFI_ArrowSchema};
@@ -272,20 +272,16 @@ fn call_java_predicate(int_array: &Int32Array) -> Result<BooleanArray> {
         ));
     }
 
-    // Get the first child array (the boolean column)
+    // Get the first child array data (the boolean column) directly
+    // We don't use StructArray::from() because it tries to slice child arrays
+    // based on the struct's offset/length, which can cause issues
     let child_data = result_array_data.child_data().get(0)
         .ok_or_else(|| datafusion_common::DataFusionError::Execution(
             "Expected at least one child in result struct".to_string()
         ))?;
 
-    // Use make_array to properly construct the BooleanArray with correct length
-    let boolean_array = make_array(child_data.clone())
-        .as_any()
-        .downcast_ref::<BooleanArray>()
-        .ok_or_else(|| datafusion_common::DataFusionError::Execution(
-            format!("Expected BooleanArray, got {:?}", child_data.data_type())
-        ))?
-        .clone();
+    // Construct the BooleanArray directly from the child ArrayData
+    let boolean_array = BooleanArray::from(child_data.clone());
 
     Ok(boolean_array)
 }
@@ -428,28 +424,6 @@ fn bench_filter(c: &mut Criterion) {
 
         group.throughput(Throughput::Bytes(ipc_size as u64));
 
-        // Benchmark 1: Filter execution only (using Java UDF)
-        group.bench_with_input(
-            BenchmarkId::new("filter_only", &label),
-            &batches,
-            |b, batches| {
-                b.iter_batched(
-                    || batches.clone(),
-                    |batches| {
-                        rt.block_on(async {
-                            let source = Arc::new(BatchSourceExec::new(Arc::clone(&schema), batches))
-                                as Arc<dyn ExecutionPlan>;
-                            let plan = create_java_filter_plan(source).unwrap();
-                            let task_ctx = Arc::new(TaskContext::default());
-                            let results = collect(plan, task_ctx).await.unwrap();
-                            black_box(results)
-                        })
-                    },
-                    BatchSize::SmallInput,
-                )
-            },
-        );
-
         // Benchmark 2: Full pipeline (deser + Java filter + output serialization)
         group.bench_with_input(
             BenchmarkId::new("full_pipeline", &label),
@@ -475,3 +449,142 @@ fn bench_filter(c: &mut Criterion) {
 
 criterion_group!(benches, bench_filter);
 criterion_main!(benches);
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Test that the Java filter returns the correct number of rows.
+    ///
+    /// The filter predicate is `colInt > 2500`, and colInt values follow the pattern `i % 5000`.
+    /// This means:
+    /// - Values range from 0 to 4999
+    /// - Values > 2500 are: 2501, 2502, ..., 4999 (2499 values)
+    /// - Expected selectivity: 2499/5000 = 49.98%
+    ///
+    /// For 1M total rows (100 batches × 10K rows), we expect:
+    /// - Filtered rows: 1,000,000 × 0.4998 = 499,800 rows
+    #[test]
+    fn test_java_filter_row_count() {
+        // Initialize JVM
+        init_jvm();
+
+        // Create Tokio runtime
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+
+        // Configuration matching the benchmark
+        let rows_per_batch = 10_000;
+        let num_batches = 100;
+        let total_rows = rows_per_batch * num_batches;
+        let binary_size = 10;
+
+        // Generate test data
+        let schema = create_schema();
+        let mut generator =
+            FunctionalBatchGenerator::new(Arc::clone(&schema), rows_per_batch, num_batches, binary_size);
+        let batches = generator.generate_batches();
+
+        // Create execution plan with Java filter
+        let source = Arc::new(BatchSourceExec::new(Arc::clone(&schema), batches))
+            as Arc<dyn ExecutionPlan>;
+        let plan = create_java_filter_plan(source).unwrap();
+
+        // Execute the plan
+        let task_ctx = Arc::new(TaskContext::default());
+        let results = rt.block_on(async {
+            collect(plan, task_ctx).await.unwrap()
+        });
+
+        // Count total rows in results
+        let filtered_row_count: usize = results.iter().map(|batch| batch.num_rows()).sum();
+
+        // Calculate expected count
+        // colInt values: i % 5000, so values are 0..4999
+        // Filter: colInt > 2500, so we keep 2501..4999 = 2499 values per 5000
+        // Expected: (total_rows / 5000) * 2499
+        let expected_count = (total_rows / 500) * 2499;
+
+        assert_eq!(
+            filtered_row_count, expected_count,
+            "Java filter returned {} rows, expected {} rows ({}% selectivity)",
+            filtered_row_count,
+            expected_count,
+            (expected_count as f64 / total_rows as f64) * 100.0
+        );
+
+        println!(
+            "✓ Java filter correctness test passed: {} rows filtered from {} total rows ({:.2}% selectivity)",
+            filtered_row_count,
+            total_rows,
+            (filtered_row_count as f64 / total_rows as f64) * 100.0
+        );
+    }
+
+    /// Test that the Java filter produces the same results as the expected filter logic
+    /// by verifying that all returned values actually satisfy the predicate.
+    #[test]
+    fn test_java_filter_correctness() {
+        // Initialize JVM
+        init_jvm();
+
+        // Create Tokio runtime
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+
+        // Use smaller dataset for detailed validation
+        let rows_per_batch = 1_000;
+        let num_batches = 10;
+        let binary_size = 10;
+
+        // Generate test data
+        let schema = create_schema();
+        let mut generator =
+            FunctionalBatchGenerator::new(Arc::clone(&schema), rows_per_batch, num_batches, binary_size);
+        let batches = generator.generate_batches();
+
+        // Create execution plan with Java filter
+        let source = Arc::new(BatchSourceExec::new(Arc::clone(&schema), batches))
+            as Arc<dyn ExecutionPlan>;
+        let plan = create_java_filter_plan(source).unwrap();
+
+        // Execute the plan
+        let task_ctx = Arc::new(TaskContext::default());
+        let results = rt.block_on(async {
+            collect(plan, task_ctx).await.unwrap()
+        });
+
+        // Verify all returned rows satisfy the predicate: colInt > 2500
+        for (batch_idx, batch) in results.iter().enumerate() {
+            let colint_array = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .expect("Expected Int32Array for colint");
+
+            for row_idx in 0..colint_array.len() {
+                let value = colint_array.value(row_idx);
+                assert!(
+                    value > 2500,
+                    "Batch {}, row {}: expected value > 2500, got {}",
+                    batch_idx,
+                    row_idx,
+                    value
+                );
+            }
+        }
+
+        let total_filtered_rows: usize = results.iter().map(|batch| batch.num_rows()).sum();
+        println!(
+            "✓ Java filter correctness test passed: all {} filtered rows satisfy colInt > 2500",
+            total_filtered_rows
+        );
+    }
+}
+
